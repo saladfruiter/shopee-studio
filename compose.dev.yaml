@@ -1,0 +1,12 @@
+name: shopee-studio-dev
+services:
+  shopee-studio:
+    build: .
+    image: shopee-studio:dev
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - shopee-dev-data:/data
+volumes:
+  shopee-dev-data:
