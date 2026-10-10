@@ -89,6 +89,14 @@ class EngineTest(unittest.TestCase):
             self.engine.send(run_id)
         self.assertEqual(len(captured),1)
 
+    def test_two_previews_cannot_send_same_products(self):
+        self.engine.sender=lambda url,body: {"ok":True,"result":{"message_id":10}}
+        first=self.engine.collect()
+        second=self.engine.collect()
+        self.engine.send(first)
+        with self.assertRaisesRegex(ValueError,"Nenhuma oferta"):
+            self.engine.send(second)
+
     def test_unknown_delivery_never_retried(self):
         def fail(url,body):
             raise TimeoutError("timeout")
@@ -168,6 +176,14 @@ class ApiTest(unittest.TestCase):
         state=self.client.get("/api/state")
         self.assertNotIn(token,state.get_data(as_text=True))
         self.assertEqual(state.json["telegram"]["thread_id"],"12")
+    def test_shopee_secret_never_returned(self):
+        headers=self.login()
+        secret="unit-test-shopee-secret"
+        result=self.client.post("/api/shopee",json={"app_id":"123","secret":secret},headers=headers)
+        self.assertEqual(result.status_code,200)
+        self.assertNotIn(secret,self.client.get("/api/state").get_data(as_text=True))
+        self.assertTrue(self.client.get("/api/state").json["shopee_configured"])
+
     def test_cross_origin_and_invalid_json_rejected(self):
         headers=self.login()
         self.assertEqual(self.client.post("/api/settings",json={},headers={**headers,"Origin":"https://evil.test"}).status_code,403)

@@ -189,7 +189,7 @@ def create_app(data_dir=None, testing=False):
     @app.get("/api/runs/<int:run_id>/preview")
     def preview(run_id):
         run = store.run(run_id)
-        products = [p for p in run["products"] if p["selected"] and p["decision"] not in ("discarded", "published")]
+        products = engine.sendable_products(run)
         return jsonify(text=telegram_text(products), destination=store.telegram_public(),
                        can_send=run["status"] == "ready" and run["delivery"] == "not_sent" and bool(products))
 

@@ -439,6 +439,11 @@ class Engine:
         finally:
             self.lock.release()
 
+    def sendable_products(self, run):
+        excluded = self.store.exclusions(run["settings"]["repeat_days"])
+        return [p for p in run["products"] if p["selected"] and p["key"] not in excluded
+                and p["decision"] not in ("discarded", "published")]
+
     def send(self, run_id):
         if not self.lock.acquire(blocking=False):
             raise ValueError("Uma operação já está em andamento.")
@@ -448,7 +453,7 @@ class Engine:
                 raise ValueError("Consulta não está disponível para envio. Envios confirmados ou incertos não são repetidos.")
             if datetime.now(timezone.utc) - datetime.fromisoformat(run["finished"]) > timedelta(hours=24):
                 raise ValueError("Consulta com mais de 24 horas. Atualize as ofertas antes de enviar.")
-            products = [p for p in run["products"] if p["selected"] and p["decision"] not in ("discarded", "published")]
+            products = self.sendable_products(run)
             if not products:
                 raise ValueError("Nenhuma oferta selecionada disponível para envio.")
             if any(p["expires"] and p["expires"] < time.time() for p in products):

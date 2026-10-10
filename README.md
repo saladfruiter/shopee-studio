@@ -71,4 +71,4 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 
 ## Scripts legados
 
-daily_shopee_top5.ps1, docker-schedule.sh e install_daily_task.ps1 foram preservados por compatibilidade, mas não são usados pelo novo container. O fluxo recomendado é o painel. Não execute os dois agendadores ao mesmo tempo.
+Na cópia local original, daily_shopee_top5.ps1, docker-schedule.sh e install_daily_task.ps1 foram preservados; eles não fazem parte desta publicação nem são usados pelo novo container. O fluxo recomendado é o painel. Não execute os dois agendadores ao mesmo tempo.
