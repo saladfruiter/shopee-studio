@@ -34,7 +34,7 @@ Cada push na branch main executa os testes e publica:
 - ghcr.io/saladfruiter/shopee-studio:latest
 - ghcr.io/saladfruiter/shopee-studio:sha-COMMIT_COMPLETO
 
-A stack de produção usa image:, sem build local. O Compose Manager pode comparar a imagem instalada com a imagem publicada e exibir atualização disponível ao usar Check for Updates. Habilite a verificação periódica nas configurações do Compose Manager para receber a indicação automaticamente. Uma alteração só fica disponível quando o workflow termina com sucesso.
+A stack de produção usa image:, sem build local. O Compose Manager pode comparar a imagem instalada com a imagem publicada e exibir atualização disponível ao usar Check for Updates. No Compose Manager Plus, habilite Auto Check for Updates e selecione Every Time para consultar ao abrir a página de stacks. Os demais intervalos limitam a frequência dessa consulta; a opção descreve uma checagem ao carregar a página, não um monitor em segundo plano. Uma alteração só fica disponível quando o workflow termina com sucesso.
 
 O primeiro pacote GHCR precisa ter visibilidade Public em GitHub → Packages → shopee-studio → Package settings. Um repositório público sozinho não torna o pacote público. Depois disso, o servidor não precisa de login para baixar.
 
