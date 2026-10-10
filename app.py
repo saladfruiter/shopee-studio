@@ -173,7 +173,7 @@ def create_app(data_dir=None, testing=False):
         store.decision(body.get("key"), body.get("state"))
         return jsonify(ok=True)
 
-    @app.post("/api/collect")
+    @app.post("/api/run-now")
     def collect():
         # The lock is acquired synchronously by the worker; collect itself arbitrates races.
         if engine.lock.locked():
