@@ -81,8 +81,6 @@ def validate_settings(payload, existing=None):
         result[key] = value
     if len(result["keyword"]) > 120:
         raise ValueError("Palavra-chave: máximo de 120 caracteres.")
-    if result["category_id"] and (not result["category_id"].isdigit() or int(result["category_id"]) > 2147483647):
-        raise ValueError("Categoria inválida.")
     try:
         datetime.strptime(result["schedule_time"], "%H:%M")
     except ValueError:
