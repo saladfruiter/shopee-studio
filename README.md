@@ -5,13 +5,15 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 ## O que faz
 
 - Consulta a API oficial, trata respostas sem campo errors e repete falhas transitórias até três vezes.
-- Filtra nicho, categoria, preço, avaliação, vendas e comissão; explica a classificação.
+- Filtra nicho, preço, avaliação, vendas e comissão; explica a classificação.
+- Alterna automaticamente entre as cinco categorias mais promissoras encontradas na consulta. Usa vendas (70%) e avaliação média (30%) como sinais de facilidade de venda e prioriza a categoria da rodada na seleção.
 - Usa comissão estimada de cliente existente quando disponível, sem misturar taxas de novos clientes. Normalização logarítmica reduz a influência de valores extremos.
 - Respeita os limites por loja/categoria; prefere mostrar menos ofertas a flexibilizar filtros silenciosamente.
 - Evita repetir produtos enviados por um intervalo configurável; produtos descartados ou já divulgados ficam excluídos até mudar sua triagem.
 - Histórico de consultas, preços observados, decisões e entregas; SQLite persiste nas atualizações.
 - Consulta manual apenas prepara a prévia. Envio manual exige confirmar no painel.
 - Configuração do Telegram pela interface: token, chat/grupo e tópico (message_thread_id). Token vazio preserva o já salvo; tópico vazio remove o destino de tópico.
+- Cada oferta enviada inclui título de vídeo, descrição curta com hashtags e prompt de 8 segundos para Google Flow. Botões do Telegram copiam cada texto com um toque.
 - Agenda diariamente em America/Sao_Paulo, recupera o horário perdido do dia ao reiniciar e tenta falhas novamente após 5 e 10 minutos.
 - Entrega incerta não é repetida automaticamente: confira o Telegram. Não há garantia de exactly-once na API do Telegram.
 - Login no painel, proteção CSRF e limitação de tentativas de login. Segredos ficam fora do Git e da imagem.
@@ -21,7 +23,7 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 1. Crie uma stack chamada shopee-studio com o conteúdo de compose.yaml deste repositório.
 2. Coloque um .env junto ao Compose, baseado em .env.example. Defina PANEL_PASSWORD. As credenciais da Shopee e do Telegram podem ser preenchidas depois pela interface.
 3. Execute Compose Up. Acesse http://IP-DO-UNRAID:8787 e use a senha PANEL_PASSWORD.
-4. Em Preferências, confira filtros, configure Telegram e o tópico. Faça uma consulta e revise a prévia.
+4. Em Preferências, confira filtros, configure Telegram e o tópico. As categorias entram em rodízio automaticamente. Faça uma consulta e revise a prévia.
 5. Habilite envio automático quando o destino e o ranking estiverem corretos. Por padrão, só gera prévias.
 
 A porta 8787 deve estar livre. PANEL_PORT altera a porta externa. Use BIND_IP para restringir à interface LAN desejada. Com proxy HTTPS, use COOKIE_SECURE=true e acesse apenas o endereço HTTPS. Não exponha diretamente a porta na internet.
@@ -63,6 +65,7 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 
 - A classificação é uma heurística configurável, não previsão de vendas ou comissão garantida.
 - Concorrência de vídeos e quantidade de avaliações não são coletadas; valide manualmente.
+- A consulta atual da Open API traz o nome do produto. Título, legenda e prompt usam esse nome e não inventam especificações que a consulta não fornece.
 - Se a busca exceder o limite de páginas, a execução falha explicitamente em vez de enviar ranking parcial.
 - Histórico registra ofertas elegíveis observadas; não é histórico completo do catálogo.
 - Logs recentes ficam limitados a 1.000 eventos. Consultas/ofertas são mantidas no SQLite para preservar histórico.
