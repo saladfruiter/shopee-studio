@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("America/Sao_Paulo")
-DEFAULTS = dict(keyword="", category_id="", min_rating=4.5, relax_rating=False,
+DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 fallback_rating=4.0, min_price=0.0, max_price=500.0, min_sales=0,
                 min_commission=0.0, repeat_days=7, per_category=2, per_shop=2,
                 top_count=5, commission_weight=50, rating_weight=30, sales_weight=20,
@@ -57,7 +58,9 @@ def safe_error(error):
 
 
 def validate_settings(payload, existing=None):
-    result = dict(existing or DEFAULTS)
+    # Ignore category_id left by older versions; category selection is automatic now.
+    result = dict(DEFAULTS)
+    result.update({key: value for key, value in (existing or {}).items() if key in DEFAULTS})
     if not isinstance(payload, dict) or set(payload) - set(DEFAULTS):
         raise ValueError("Configuração desconhecida.")
     for key, value in payload.items():
@@ -78,8 +81,6 @@ def validate_settings(payload, existing=None):
         result[key] = value
     if len(result["keyword"]) > 120:
         raise ValueError("Palavra-chave: máximo de 120 caracteres.")
-    if result["category_id"] and (not result["category_id"].isdigit() or int(result["category_id"]) > 2147483647):
-        raise ValueError("Categoria inválida.")
     try:
         datetime.strptime(result["schedule_time"], "%H:%M")
     except ValueError:
@@ -112,6 +113,8 @@ class Store:
                 CREATE TABLE IF NOT EXISTS shopee (id INTEGER PRIMARY KEY CHECK(id=1), app_id TEXT, secret TEXT);
                 CREATE TABLE IF NOT EXISTS telegram (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, chat_id TEXT, thread_id TEXT);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS category_rotation (
+                    id INTEGER PRIMARY KEY CHECK(id=1), last_category TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY, started TEXT, finished TEXT, status TEXT,
                     source TEXT, settings TEXT, warning TEXT, error TEXT, scanned INTEGER DEFAULT 0,
@@ -129,7 +132,7 @@ class Store:
                     id INTEGER PRIMARY KEY, created TEXT, level TEXT, message TEXT);
             """)
             first = dict(DEFAULTS)
-            for env, key in (("SHOPEE_KEYWORD", "keyword"), ("SHOPEE_PRODUCT_CAT_ID", "category_id"),
+            for env, key in (("SHOPEE_KEYWORD", "keyword"),
                              ("SHOPEE_MIN_RATING", "min_rating"), ("SHOPEE_PAGE_LIMIT", "page_limit"),
                              ("SHOPEE_MAX_PAGES", "max_pages")):
                 if os.environ.get(env):
@@ -138,6 +141,10 @@ class Store:
             first["auto_send"] = os.environ.get("AUTO_SEND", "false").lower() == "true"
             first = validate_settings(first)
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,?)", (json.dumps(first),))
+            stored_settings = json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0])
+            migrated_settings = validate_settings({}, stored_settings)
+            if migrated_settings != stored_settings:
+                db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(migrated_settings),))
             # A process crash during delivery is ambiguous; never automatically resend it.
             db.execute("UPDATE runs SET delivery='unknown' WHERE delivery='sending'")
             db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status='running'", (utcnow(),))
@@ -158,7 +165,7 @@ class Store:
 
     def settings(self):
         with self.db() as db:
-            return json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0])
+            return validate_settings({}, json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0]))
 
     def save_settings(self, payload):
         value = validate_settings(payload, self.settings())
@@ -166,6 +173,19 @@ class Store:
             db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(value),))
         self.log("info", "Configurações atualizadas.")
         return value
+
+    def rotate_category(self, categories):
+        """Advance through the current five best-selling category candidates."""
+        categories = list(dict.fromkeys(str(category) for category in categories if category))
+        if not categories:
+            return None
+        with self.db() as db:
+            row = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
+            last = row[0] if row else None
+            next_category = categories[(categories.index(last) + 1) % len(categories)] if last in categories else categories[0]
+            db.execute("INSERT INTO category_rotation VALUES(1,?) ON CONFLICT(id) DO UPDATE SET last_category=excluded.last_category",
+                       (next_category,))
+        return next_category
 
     def log(self, level, message):
         with self.db() as db:
@@ -276,8 +296,6 @@ def shopee_query(settings, page):
     args = ["listType: 0", "sortType: 5", f"page: {page}", f"limit: {settings['page_limit']}"]
     if settings["keyword"]:
         args.append("keyword: " + json.dumps(settings["keyword"], ensure_ascii=False))
-    if settings["category_id"]:
-        args.append("productCatId: " + settings["category_id"])
     return """query { productOfferV2(%s) {
       nodes { itemId shopId productName shopName offerLink price priceMin priceMax
         commission commissionRate appExistRate appNewRate ratingStar sales
@@ -331,7 +349,7 @@ def fetch_offers(settings, credentials=None):
     return all_nodes
 
 
-def rank_offers(nodes, settings, excluded=None, now=None):
+def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=None):
     excluded, now = excluded or set(), now or time.time()
     unique = {}
     for node in nodes:
@@ -378,8 +396,11 @@ def rank_offers(nodes, settings, excluded=None, now=None):
         p["reasons"] = [f"Comissão estimada R$ {p['commission']:.2f} ({p['commission_basis']})",
                         f"Avaliação {p['rating']:.1f}/5", f"{p['sales']} vendas informadas"]
     candidates.sort(key=lambda p: (-p["score"], p["key"]))
+    selection_order = candidates
+    if preferred_category:
+        selection_order = sorted(candidates, key=lambda p: (p["category"] != preferred_category, -p["score"], p["key"]))
     selected, categories, shops = [], {}, {}
-    for p in candidates:
+    for p in selection_order:
         cat, shop = p["category"] or "sem_categoria", p["shop_id"]
         if categories.get(cat, 0) >= settings["per_category"] or shops.get(shop, 0) >= settings["per_shop"]:
             continue
@@ -393,11 +414,88 @@ def rank_offers(nodes, settings, excluded=None, now=None):
     return candidates, set(selected), warning.strip()
 
 
+def easiest_categories(candidates, limit=5):
+    """Rank available categories by sales volume (70%) and rating (30%)."""
+    if not candidates:
+        return []
+    max_sales = max((math.log1p(max(0, p["sales"])) for p in candidates), default=0)
+    scores = {}
+    counts = {}
+    for product in candidates:
+        category = product["category"]
+        if not category:
+            continue
+        sales_signal = math.log1p(max(0, product["sales"])) / max_sales if max_sales else 0
+        rating_signal = max(0, min(5, product["rating"])) / 5
+        scores[category] = scores.get(category, 0) + 0.7 * sales_signal + 0.3 * rating_signal
+        counts[category] = counts.get(category, 0) + 1
+    ordered = sorted(scores, key=lambda category: (-scores[category] / counts[category], category))
+    return ordered[:limit]
+
+
+def social_copy(product):
+    name = re.sub(r"\s+", " ", str(product.get("name") or "Produto")).strip()
+    title = f"Conheça: {name}"
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", name)
+    stopwords = {"com", "para", "sem", "por", "uma", "um", "de", "da", "do", "das", "dos", "e", "em", "no", "na", "kit", "novo", "nova"}
+    hashtags = []
+    for word in words:
+        if len(word) < 3 or word.casefold() in stopwords:
+            continue
+        tag = "".join(char for char in unicodedata.normalize("NFKD", word) if not unicodedata.combining(char))
+        tag = re.sub(r"[^A-Za-z0-9_]", "", tag)
+        if tag and f"#{tag}" not in hashtags:
+            hashtags.append(f"#{tag}")
+        if len(hashtags) == 2:
+            break
+    tags = " ".join(["#Shopee", "#Achadinhos", *hashtags])
+    description = shorten_copy(f"Confira {name} na Shopee! {tags}")
+    title = shorten_copy(title)
+    prompt_template = "Google Flow, vídeo 9:16, 8 s: {title}. Português do Brasil. Descrição: {description}. Demonstre em uso, closes dinâmicos, narração persuasiva e CTA ‘Compre na Shopee’. Não invente."
+    fixed_length = len(prompt_template.format(title="", description=""))
+    available = max(0, 256 - fixed_length)
+    title_limit = min(len(title), max(1, available // 2))
+    description_limit = min(len(description), available - title_limit)
+
+    prompt = prompt_template.format(title=shorten_copy(title, title_limit),
+                                    description=shorten_copy(description, description_limit))
+    return dict(title=title, description=description, prompt=prompt)
+
+
+def shorten_copy(value, limit=256):
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:max(0, limit)]
+    shortened = value[:limit - 1].rsplit(" ", 1)[0].strip()
+    return (shortened or value[:limit - 1]).rstrip(" ,;:") + "…"
+
+
+def telegram_keyboard(products):
+    keyboard = []
+    for index, product in enumerate(products, 1):
+        copy = social_copy(product)
+        keyboard.append([
+            {"text": f"📋 Título {index}", "copy_text": {"text": copy["title"]}},
+            {"text": f"📋 Descrição {index}", "copy_text": {"text": copy["description"]}},
+        ])
+        keyboard.append([
+            {"text": f"🎬 Prompt 8s {index}", "copy_text": {"text": copy["prompt"]}},
+        ])
+    return {"inline_keyboard": keyboard}
+
+
 def telegram_text(products):
-    lines = [f"Top {len(products)} Shopee · {datetime.now(TZ):%d/%m/%Y}", "Comissões estimadas, não garantidas no canal Vídeo.", ""]
+    lines = [f"Top {len(products)} Shopee · {datetime.now(TZ):%d/%m/%Y}",
+             "Comissões estimadas, não garantidas no canal Vídeo.",
+             "Toque nos botões para copiar título, descrição ou prompt.", ""]
     for index, p in enumerate(products, 1):
+        copy = social_copy(p)
         lines.extend([f"{index}. {p['name'][:100]}", f"R$ {p['price']:.2f} · comissão estimada R$ {p['commission']:.2f}",
-                      f"Nota {p['rating']:.1f} · {p['sales']} vendas · score {p['score']:.1f}", p["link"], ""])
+                      f"Nota {p['rating']:.1f} · {p['sales']} vendas · score {p['score']:.1f}", p["link"],
+                      f"🎬 TÍTULO DO VÍDEO · {copy['title']}",
+                      f"📝 DESCRIÇÃO · {copy['description']}",
+                      f"🎥 PROMPT GOOGLE FLOW (8 s) · {copy['prompt']}", ""])
     text = "\n".join(lines)
     if len(text.encode("utf-16-le")) // 2 > 4096:
         raise ValueError("Prévia excede o limite do Telegram; reduza a quantidade de produtos.")
@@ -423,12 +521,17 @@ class Engine:
             self.store.log("info", f"Consulta #{run_id} iniciada ({source}).")
             try:
                 nodes = self.fetcher(settings)
-                candidates, selected, warning = rank_offers(nodes, settings, self.store.exclusions(settings["repeat_days"]))
+                excluded = self.store.exclusions(settings["repeat_days"])
+                candidates, _, _ = rank_offers(nodes, settings, excluded)
+                rotation_category = self.store.rotate_category(easiest_categories(candidates))
+                candidates, selected, warning = rank_offers(
+                    nodes, settings, excluded, preferred_category=rotation_category)
+                run_settings = dict(settings, rotation_category=rotation_category)
                 with self.store.db() as db:
                     for product in candidates:
                         db.execute("INSERT INTO offers VALUES(?,?,?,?)", (run_id, product["key"], json.dumps(product), int(product["key"] in selected)))
-                    db.execute("UPDATE runs SET status='ready',finished=?,scanned=?,warning=? WHERE id=?",
-                               (utcnow(), len(nodes), warning, run_id))
+                    db.execute("UPDATE runs SET settings=?,status='ready',finished=?,scanned=?,warning=? WHERE id=?",
+                               (json.dumps(run_settings), utcnow(), len(nodes), warning, run_id))
                 self.store.log("info", f"Consulta #{run_id}: {len(nodes)} ofertas consultadas, {len(selected)} selecionadas.")
             except Exception as error:
                 with self.store.db() as db:
@@ -463,16 +566,18 @@ class Engine:
             if not token or not chat:
                 raise ValueError("Configure o Telegram no .env.")
             text = telegram_text(products)
+            payload = {"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True},
+                       "reply_markup": telegram_keyboard(products)}
+            if telegram["thread_id"]:
+                payload["message_thread_id"] = int(telegram["thread_id"])
+            body = json.dumps(payload).encode()
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
             with self.store.db() as db:
                 changed = db.execute("UPDATE runs SET delivery='sending' WHERE id=? AND delivery='not_sent'", (run_id,)).rowcount
                 if changed != 1:
                     raise ValueError("Envio já iniciado.")
-            payload = {"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True}}
-            if telegram["thread_id"]:
-                payload["message_thread_id"] = int(telegram["thread_id"])
-            body = json.dumps(payload).encode()
             try:
-                result = self.sender(f"https://api.telegram.org/bot{token}/sendMessage", body)
+                result = self.sender(url, body)
                 if not result.get("ok"):
                     raise ValueError("Telegram recusou o envio.")
                 message_id = result["result"]["message_id"]
