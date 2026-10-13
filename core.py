@@ -18,12 +18,13 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("America/Sao_Paulo")
 DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 fallback_rating=4.0, min_price=0.0, max_price=500.0, min_sales=0,
-                min_commission=0.0, repeat_days=7, per_category=2, per_shop=2,
+                min_commission=0.0, repeat_days=7, per_shop=2,
                 top_count=5, commission_weight=50, rating_weight=30, sales_weight=20,
                 schedule_time="12:00", schedule_enabled=True, auto_send=False,
                 max_pages=100, page_limit=20)
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
+CATEGORY_SAMPLE_PAGES = 3
 
 
 def utcnow():
@@ -93,7 +94,7 @@ def validate_settings(payload, existing=None):
     if result["max_price"] and result["max_price"] < result["min_price"]:
         raise ValueError("Preço máximo menor que o mínimo.")
     for key, low, high in (("repeat_days", 0, 365), ("top_count", 1, 10),
-                           ("per_category", 1, 10), ("per_shop", 1, 10),
+                           ("per_shop", 1, 10),
                            ("max_pages", 1, 500), ("page_limit", 1, 50)):
         if not low <= result[key] <= high:
             raise ValueError(f"{key}: use {low} a {high}.")
@@ -174,18 +175,27 @@ class Store:
         self.log("info", "Configurações atualizadas.")
         return value
 
-    def rotate_category(self, categories):
-        """Advance through the current five best-selling category candidates."""
+    def next_category(self, categories):
+        """Choose the next category without advancing the rotation yet."""
         categories = list(dict.fromkeys(str(category) for category in categories if category))
         if not categories:
             return None
         with self.db() as db:
             row = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
             last = row[0] if row else None
-            next_category = categories[(categories.index(last) + 1) % len(categories)] if last in categories else categories[0]
-            db.execute("INSERT INTO category_rotation VALUES(1,?) ON CONFLICT(id) DO UPDATE SET last_category=excluded.last_category",
-                       (next_category,))
-        return next_category
+        return categories[(categories.index(last) + 1) % len(categories)] if last in categories else categories[0]
+
+    def remember_category(self, category):
+        if category:
+            with self.db() as db:
+                db.execute("INSERT INTO category_rotation VALUES(1,?) ON CONFLICT(id) DO UPDATE SET last_category=excluded.last_category",
+                           (str(category),))
+
+    def rotate_category(self, categories):
+        """Advance through the current best-selling category candidates."""
+        category = self.next_category(categories)
+        self.remember_category(category)
+        return category
 
     def log(self, level, message):
         with self.db() as db:
@@ -292,8 +302,22 @@ class Store:
                 WHERE o.product_key=? ORDER BY r.id DESC LIMIT 60""", (key,))]
 
 
-def shopee_query(settings, page):
-    args = ["listType: 0", "sortType: 5", f"page: {page}", f"limit: {settings['page_limit']}"]
+def product_category_id(node):
+    categories = node.get("productCatIds") or []
+    for value in reversed(categories):
+        category = str(value).strip()
+        if category.isdigit() and 0 < int(category) <= 2147483647:
+            return category
+    return ""
+
+
+def shopee_query(settings, page, category_id=None, sort_type=5):
+    args = ["listType: 0", f"sortType: {sort_type}", f"page: {page}", f"limit: {settings['page_limit']}"]
+    if category_id:
+        category = str(category_id).strip()
+        if not category.isdigit() or not 0 < int(category) <= 2147483647:
+            raise ValueError("Categoria automática inválida.")
+        args.append(f"productCatId: {int(category)}")
     if settings["keyword"]:
         args.append("keyword: " + json.dumps(settings["keyword"], ensure_ascii=False))
     return """query { productOfferV2(%s) {
@@ -311,45 +335,68 @@ def request_json(url, body, headers=None):
         return json.load(response)
 
 
-def fetch_offers(settings, credentials=None):
+def fetch_product_page(settings, page, credentials, category_id=None, sort_type=5):
+    app_id, secret = credentials["app_id"], credentials["secret"]
+    body = json.dumps({"query": shopee_query(settings, page, category_id, sort_type)},
+                      ensure_ascii=False, separators=(",", ":")).encode()
+    for attempt in range(3):
+        timestamp = str(int(time.time()))
+        signature = hashlib.sha256(app_id.encode() + timestamp.encode() + body + secret.encode()).hexdigest()
+        try:
+            result = request_json(API, body, {"Authorization": f"SHA256 Credential={app_id}, Signature={signature}, Timestamp={timestamp}"})
+            break
+        except urllib.error.HTTPError as error:
+            if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise ValueError(f"Shopee retornou HTTP {error.code}.") from None
+            time.sleep(2 ** (attempt + 1))
+        except (OSError, TimeoutError):
+            if attempt == 2:
+                raise ValueError("Shopee indisponível após três tentativas.") from None
+            time.sleep(2 ** (attempt + 1))
+    if result.get("errors"):
+        raise ValueError("Shopee: " + "; ".join(e.get("message", "Erro GraphQL") for e in result["errors"]))
+    data = (result.get("data") or {}).get("productOfferV2")
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        raise ValueError("Resposta da Shopee sem lista de ofertas válida.")
+    page_info = data.get("pageInfo") or {}
+    if page_info.get("hasNextPage") and not data["nodes"]:
+        raise ValueError("Paginação inconsistente: página vazia com continuação.")
+    return data
+
+
+def fetch_offer_pages(settings, credentials=None, category_id=None, sort_type=5,
+                      max_pages=None, require_complete=True):
     credentials = credentials or dict(app_id=os.environ.get("SHOPEE_APP_ID"), secret=os.environ.get("SHOPEE_SECRET"))
     app_id, secret = credentials["app_id"], credentials["secret"]
     if not app_id or not secret:
         raise ValueError("Configure SHOPEE_APP_ID e SHOPEE_SECRET no .env.")
+    page_count = settings["max_pages"] if max_pages is None else max_pages
     all_nodes, complete = [], False
-    for page in range(1, settings["max_pages"] + 1):
-        body = json.dumps({"query": shopee_query(settings, page)}, ensure_ascii=False, separators=(",", ":")).encode()
-        for attempt in range(3):
-            timestamp = str(int(time.time()))
-            signature = hashlib.sha256(app_id.encode() + timestamp.encode() + body + secret.encode()).hexdigest()
-            try:
-                result = request_json(API, body, {"Authorization": f"SHA256 Credential={app_id}, Signature={signature}, Timestamp={timestamp}"})
-                break
-            except urllib.error.HTTPError as error:
-                if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
-                    raise ValueError(f"Shopee retornou HTTP {error.code}.") from None
-                time.sleep(2 ** (attempt + 1))
-            except (OSError, TimeoutError):
-                if attempt == 2:
-                    raise ValueError("Shopee indisponível após três tentativas.") from None
-                time.sleep(2 ** (attempt + 1))
-        if result.get("errors"):
-            raise ValueError("Shopee: " + "; ".join(e.get("message", "Erro GraphQL") for e in result["errors"]))
-        data = (result.get("data") or {}).get("productOfferV2")
-        if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
-            raise ValueError("Resposta da Shopee sem lista de ofertas válida.")
+    for page in range(1, page_count + 1):
+        data = fetch_product_page(settings, page, credentials, category_id, sort_type)
         all_nodes.extend(data["nodes"])
         if not (data.get("pageInfo") or {}).get("hasNextPage"):
             complete = True
             break
-        if not data["nodes"]:
-            raise ValueError("Paginação inconsistente: página vazia com continuação.")
-    if not complete:
-        raise ValueError("Limite de páginas atingido. Restrinja o nicho ou aumente o limite; ranking incompleto não foi enviado.")
+    if require_complete and not complete:
+        scope = f" na categoria {category_id}" if category_id else ""
+        raise ValueError(f"Limite de páginas atingido{scope}. Restrinja o nicho ou aumente o limite; ranking incompleto não foi enviado.")
     return all_nodes
 
 
-def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=None):
+def fetch_category_sample(settings, credentials=None):
+    """Read a small sales-sorted sample to choose a category before the full collection."""
+    sample_pages = min(CATEGORY_SAMPLE_PAGES, settings["max_pages"])
+    return fetch_offer_pages(settings, credentials, sort_type=2, max_pages=sample_pages,
+                             require_complete=False)
+
+
+def fetch_offers(settings, credentials=None, category_id=None):
+    return fetch_offer_pages(settings, credentials, category_id=category_id,
+                             sort_type=5, require_complete=True)
+
+
+def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=None, strict_category=False):
     excluded, now = excluded or set(), now or time.time()
     unique = {}
     for node in nodes:
@@ -377,12 +424,14 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
                            name=str(node.get("productName") or "Produto"), shop=str(node.get("shopName") or ""),
                            price=price, commission=payout, app_existing_rate=rate, app_new_rate=new_rate,
                            commission_basis="cliente existente" if rate > 0 else "comissão informada pela API",
-                           rating=rating, sales=int(sales), category=str((node.get("productCatIds") or [""])[0]),
+                           rating=rating, sales=int(sales), category=product_category_id(node),
                            link=link, expires=end if math.isfinite(end) and end > 0 else None)
-    candidates = [p for p in unique.values() if p["rating"] >= settings["min_rating"]]
+    eligible = [p for p in unique.values()
+                if not strict_category or p["category"] == str(preferred_category)]
+    candidates = [p for p in eligible if p["rating"] >= settings["min_rating"]]
     warning = ""
     if len(candidates) < settings["top_count"] and settings["relax_rating"]:
-        candidates = [p for p in unique.values() if p["rating"] >= settings["fallback_rating"]]
+        candidates = [p for p in eligible if p["rating"] >= settings["fallback_rating"]]
         warning = f"Nota mínima flexibilizada para {settings['fallback_rating']:.1f}, conforme sua configuração."
     if not candidates:
         raise ValueError("Nenhuma oferta passou pelos filtros e pelo intervalo de repetição.")
@@ -397,12 +446,12 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
                         f"Avaliação {p['rating']:.1f}/5", f"{p['sales']} vendas informadas"]
     candidates.sort(key=lambda p: (-p["score"], p["key"]))
     selection_order = candidates
-    if preferred_category:
+    if preferred_category and not strict_category:
         selection_order = sorted(candidates, key=lambda p: (p["category"] != preferred_category, -p["score"], p["key"]))
     selected, categories, shops = [], {}, {}
     for p in selection_order:
         cat, shop = p["category"] or "sem_categoria", p["shop_id"]
-        if categories.get(cat, 0) >= settings["per_category"] or shops.get(shop, 0) >= settings["per_shop"]:
+        if (not strict_category and categories.get(cat, 0) >= settings.get("per_category", 2)) or shops.get(shop, 0) >= settings["per_shop"]:
             continue
         selected.append(p["key"])
         categories[cat] = categories.get(cat, 0) + 1
@@ -415,22 +464,32 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
 
 
 def easiest_categories(candidates, limit=5):
-    """Rank available categories by sales volume (70%) and rating (30%)."""
+    """Rank available categories by total sampled sales (70%) and average rating (30%)."""
     if not candidates:
         return []
-    max_sales = max((math.log1p(max(0, p["sales"])) for p in candidates), default=0)
-    scores = {}
-    counts = {}
+    stats = {}
     for product in candidates:
         category = product["category"]
         if not category:
             continue
-        sales_signal = math.log1p(max(0, product["sales"])) / max_sales if max_sales else 0
-        rating_signal = max(0, min(5, product["rating"])) / 5
-        scores[category] = scores.get(category, 0) + 0.7 * sales_signal + 0.3 * rating_signal
-        counts[category] = counts.get(category, 0) + 1
-    ordered = sorted(scores, key=lambda category: (-scores[category] / counts[category], category))
+        stat = stats.setdefault(category, {"sales": 0, "rating": 0.0, "count": 0})
+        stat["sales"] += max(0, number(product["sales"]))
+        stat["rating"] += max(0, min(5, number(product["rating"])))
+        stat["count"] += 1
+    max_sales = max((math.log1p(stat["sales"]) for stat in stats.values()), default=0)
+    scores = {
+        category: 0.7 * (math.log1p(stat["sales"]) / max_sales if max_sales else 0)
+        + 0.3 * (stat["rating"] / stat["count"] / 5)
+        for category, stat in stats.items()
+    }
+    ordered = sorted(scores, key=lambda category: (-scores[category], category))
     return ordered[:limit]
+
+
+def category_signals(nodes):
+    return [dict(category=product_category_id(node), sales=number(node.get("sales")),
+                 rating=number(node.get("ratingStar")))
+            for node in nodes if product_category_id(node)]
 
 
 def social_copy(product):
@@ -503,9 +562,14 @@ def telegram_text(products):
 
 
 class Engine:
-    def __init__(self, store, fetcher=None, sender=request_json):
+    def __init__(self, store, fetcher=None, sender=request_json, category_fetcher=None):
         self.store, self.sender = store, sender
-        self.fetcher = fetcher or (lambda settings: fetch_offers(settings, store.shopee()))
+        if fetcher is None:
+            self.category_fetcher = category_fetcher or (lambda settings: fetch_category_sample(settings, store.shopee()))
+            self.fetcher = lambda settings, category: fetch_offers(settings, store.shopee(), category)
+        else:
+            self.category_fetcher = category_fetcher
+            self.fetcher = fetcher
         self.lock = threading.Lock()
         self.heartbeat = time.time()
         self.stop = threading.Event()
@@ -520,18 +584,30 @@ class Engine:
                                     (utcnow(), source, json.dumps(settings))).lastrowid
             self.store.log("info", f"Consulta #{run_id} iniciada ({source}).")
             try:
-                nodes = self.fetcher(settings)
                 excluded = self.store.exclusions(settings["repeat_days"])
-                candidates, _, _ = rank_offers(nodes, settings, excluded)
-                rotation_category = self.store.rotate_category(easiest_categories(candidates))
-                candidates, selected, warning = rank_offers(
-                    nodes, settings, excluded, preferred_category=rotation_category)
+                if self.category_fetcher:
+                    sample_nodes = self.category_fetcher(settings)
+                    categories = easiest_categories(category_signals(sample_nodes))
+                    rotation_category = self.store.next_category(categories)
+                    if not rotation_category:
+                        raise ValueError("Não foi possível identificar uma categoria vendável na amostra da Shopee.")
+                    nodes = self.fetcher(settings, rotation_category)
+                    candidates, selected, warning = rank_offers(
+                        nodes, settings, excluded, preferred_category=rotation_category, strict_category=True)
+                else:
+                    # Injected fetchers keep the existing one-call contract for tests and integrations.
+                    nodes = self.fetcher(settings)
+                    discovery, _, _ = rank_offers(nodes, settings, excluded)
+                    rotation_category = self.store.next_category(easiest_categories(discovery))
+                    candidates, selected, warning = rank_offers(
+                        nodes, settings, excluded, preferred_category=rotation_category)
                 run_settings = dict(settings, rotation_category=rotation_category)
                 with self.store.db() as db:
                     for product in candidates:
                         db.execute("INSERT INTO offers VALUES(?,?,?,?)", (run_id, product["key"], json.dumps(product), int(product["key"] in selected)))
                     db.execute("UPDATE runs SET settings=?,status='ready',finished=?,scanned=?,warning=? WHERE id=?",
                                (json.dumps(run_settings), utcnow(), len(nodes), warning, run_id))
+                self.store.remember_category(rotation_category)
                 self.store.log("info", f"Consulta #{run_id}: {len(nodes)} ofertas consultadas, {len(selected)} selecionadas.")
             except Exception as error:
                 with self.store.db() as db:

@@ -6,9 +6,9 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 
 - Consulta a API oficial, trata respostas sem campo errors e repete falhas transitórias até três vezes.
 - Filtra nicho, preço, avaliação, vendas e comissão; explica a classificação.
-- Alterna automaticamente entre as cinco categorias mais promissoras encontradas na consulta. Usa vendas (70%) e avaliação média (30%) como sinais de facilidade de venda e prioriza a categoria da rodada na seleção.
+- Analisa uma amostra ordenada por vendas para descobrir até cinco categorias promissoras; alterna entre elas e consulta ofertas somente na categoria da rodada. Usa vendas observadas na amostra (70%) e avaliação média (30%) como sinais de facilidade de venda.
 - Usa comissão estimada de cliente existente quando disponível, sem misturar taxas de novos clientes. Normalização logarítmica reduz a influência de valores extremos.
-- Respeita os limites por loja/categoria; prefere mostrar menos ofertas a flexibilizar filtros silenciosamente.
+- Respeita o limite por loja e mantém os produtos da rodada na categoria escolhida automaticamente.
 - Evita repetir produtos enviados por um intervalo configurável; produtos descartados ou já divulgados ficam excluídos até mudar sua triagem.
 - Histórico de consultas, preços observados, decisões e entregas; SQLite persiste nas atualizações.
 - Consulta manual apenas prepara a prévia. Envio manual exige confirmar no painel.
@@ -66,7 +66,7 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 - A classificação é uma heurística configurável, não previsão de vendas ou comissão garantida.
 - Concorrência de vídeos e quantidade de avaliações não são coletadas; valide manualmente.
 - A consulta atual da Open API traz o nome do produto. Título, legenda e prompt usam esse nome e não inventam especificações que a consulta não fornece.
-- Se a busca exceder o limite de páginas, a execução falha explicitamente em vez de enviar ranking parcial.
+- A descoberta de categorias lê até três páginas de amostra ordenadas por vendas; a coleta completa depois pagina apenas a categoria escolhida. Se essa busca ainda exceder o limite configurado, a execução falha em vez de enviar ranking parcial.
 - Histórico registra ofertas elegíveis observadas; não é histórico completo do catálogo.
 - Logs recentes ficam limitados a 1.000 eventos. Consultas/ofertas são mantidas no SQLite para preservar histórico.
 - Um único processo/container deve usar o banco. Não escale réplicas.
