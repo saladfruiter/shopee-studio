@@ -567,9 +567,11 @@ class Engine:
         if fetcher is None:
             self.category_fetcher = category_fetcher or (lambda settings: fetch_category_sample(settings, store.shopee()))
             self.fetcher = lambda settings, category: fetch_offers(settings, store.shopee(), category)
+            self.category_aware_fetcher = self.fetcher
         else:
             self.category_fetcher = category_fetcher
             self.fetcher = fetcher
+            self.category_aware_fetcher = fetcher if category_fetcher is not None else None
         self.lock = threading.Lock()
         self.heartbeat = time.time()
         self.stop = threading.Event()
@@ -585,7 +587,7 @@ class Engine:
             self.store.log("info", f"Consulta #{run_id} iniciada ({source}).")
             try:
                 excluded = self.store.exclusions(settings["repeat_days"])
-                if self.category_fetcher:
+                if self.category_fetcher and self.fetcher is self.category_aware_fetcher:
                     sample_nodes = self.category_fetcher(settings)
                     categories = easiest_categories(category_signals(sample_nodes))
                     rotation_category = self.store.next_category(categories)
