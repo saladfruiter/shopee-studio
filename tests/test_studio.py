@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
-from core import DEFAULTS, Engine, Store, TZ, fetch_offers, rank_offers, validate_settings
+from core import DEFAULTS, Engine, Store, TZ, fetch_offers, rank_offers, shopee_query, validate_settings
 from app import create_app
 
 
@@ -31,10 +31,11 @@ class RankingTest(unittest.TestCase):
         products,_,warning=rank_offers([node(ratingStar="4.1")],dict(DEFAULTS,relax_rating=True))
         self.assertEqual(len(products),1)
         self.assertIn("flexibilizada",warning)
-    def test_diversity_not_silently_overridden(self):
+    def test_categories_do_not_limit_products(self):
         _,selected,warning=rank_offers([node(i,productCatIds=[1]) for i in range(1,7)],DEFAULTS)
-        self.assertEqual(len(selected),2)
-        self.assertIn("preservados",warning)
+        self.assertEqual(len(selected),5)
+        self.assertEqual(warning,"")
+        self.assertNotIn("productCatId",shopee_query(DEFAULTS,1))
     def test_price_expiry_and_missing_expiry(self):
         products,_,_=rank_offers([node(),node(2,price="1000"),node(3,periodEndTime=1)],DEFAULTS)
         self.assertEqual(len(products),1)
@@ -56,10 +57,10 @@ class RankingTest(unittest.TestCase):
         self.assertEqual(request.call_count,2)
     @patch.dict(os.environ,{"SHOPEE_APP_ID":"123","SHOPEE_SECRET":"secret"})
     @patch("core.request_json")
-    def test_incomplete_ranking_rejected(self,request):
+    def test_bounded_product_search(self,request):
         request.return_value={"data":{"productOfferV2":{"nodes":[node()],"pageInfo":{"hasNextPage":True}}}}
-        with self.assertRaisesRegex(ValueError,"Limite"):
-            fetch_offers(dict(DEFAULTS,max_pages=1))
+        self.assertEqual(len(fetch_offers(dict(DEFAULTS,max_pages=1))),1)
+        self.assertEqual(request.call_count,1)
 
 
 class EngineTest(unittest.TestCase):
@@ -76,26 +77,6 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.store.run(run_id)["delivery"],"not_sent")
         self.assertEqual(len(self.store.history("1:1")),1)
         self.assertEqual(Store(self.temp.name).runs()[0]["id"],run_id)
-
-    def test_category_cooldown_and_persisted_queue(self):
-        day=datetime(2026,10,1,12,tzinfo=TZ)
-        categories=[str(i) for i in range(1,7)]
-        self.store.save_category_queue(categories)
-        for offset in range(6):
-            now=day+timedelta(days=offset)
-            category=self.store.next_category(categories,now)
-            self.assertEqual(category,categories[offset])
-            self.store.remember_category(category,now)
-        self.assertEqual(Store(self.temp.name).next_category(categories,day+timedelta(days=6)),"1")
-        with self.assertRaisesRegex(ValueError,"últimos 5 dias"):
-            self.store.next_category(categories,day+timedelta(days=5))
-
-    def test_custom_queue_order_and_validation(self):
-        self.store.save_category_queue(["6","5","4","3","2","1"])
-        self.assertEqual(self.store.next_category(["7","8"]),"6")
-        self.assertEqual(self.store.category_queue()["queue"],["6","5","4","3","2","1"])
-        with self.assertRaises(ValueError):
-            self.store.save_category_queue(["1","1","2","3","4","5"])
 
     def test_topic_payload_and_duplicate_delivery_guard(self):
         captured=[]
@@ -220,12 +201,6 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn(token,state.get_data(as_text=True))
         self.assertEqual(state.json["telegram"]["thread_id"],"12")
 
-    def test_category_queue_api(self):
-        headers=self.login()
-        queue=[str(i) for i in range(1,7)]
-        result=self.client.post("/api/category-queue",json={"queue":queue},headers=headers)
-        self.assertEqual(result.status_code,200)
-        self.assertEqual(self.client.get("/api/state").json["category_rotation"]["queue"],queue)
     def test_shopee_secret_never_returned(self):
         headers=self.login()
         secret="unit-test-shopee-secret"

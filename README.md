@@ -6,9 +6,9 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 
 - Consulta a API oficial, trata respostas sem campo errors e repete falhas transitórias até três vezes.
 - Filtra nicho, preço, avaliação, vendas e comissão; explica a classificação.
-- Analisa uma amostra ordenada por vendas para descobrir até 20 categorias promissoras; consulta ofertas somente na categoria da rodada. Usa vendas observadas na amostra (70%) e avaliação média (30%) como sinais de facilidade de venda. A categoria usada fica fora do rodízio nos cinco dias seguintes.
+- Consulta produtos diretamente, sem rodízio ou filtro de categoria. Analisa até o limite de páginas configurado e classifica as ofertas encontradas por comissão, avaliação e vendas.
 - Usa comissão estimada de cliente existente quando disponível, sem misturar taxas de novos clientes. Normalização logarítmica reduz a influência de valores extremos.
-- Respeita o limite por loja e mantém os produtos da rodada na categoria escolhida automaticamente.
+- Respeita o limite por loja na seleção.
 - Exclui permanentemente das novas consultas os anúncios já enviados ao Telegram, identificados por loja e item. Uma entrega incerta também fica excluída para evitar um possível reenvio; produtos descartados ou já divulgados ficam excluídos até mudar sua triagem.
 - Histórico de consultas, preços observados, decisões e entregas; SQLite persiste nas atualizações.
 - Consulta manual apenas prepara a prévia. Envio manual exige confirmar no painel.
@@ -23,7 +23,7 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 1. Crie uma stack chamada shopee-studio com o conteúdo de compose.yaml deste repositório.
 2. Coloque um .env junto ao Compose, baseado em .env.example. Defina PANEL_PASSWORD. As credenciais da Shopee e do Telegram podem ser preenchidas depois pela interface.
 3. Execute Compose Up. Acesse http://IP-DO-UNRAID:8787 e use a senha PANEL_PASSWORD.
-4. Em Preferências, confira filtros, configure Telegram e o tópico. A fila de categorias aparece após a primeira consulta e pode ser editada com IDs, um por linha. Salvar a fila fixa sua ordem; use pelo menos seis categorias para permitir uma consulta diária sem repetição nos cinco dias seguintes. Faça uma consulta e revise a prévia.
+4. Em Preferências, confira filtros, configure Telegram e o tópico. Faça uma consulta e revise a prévia. Anúncios já enviados pelo aplicativo ficam excluídos permanentemente.
 5. Habilite envio automático quando o destino e o ranking estiverem corretos. Por padrão, só gera prévias.
 
 A porta 8787 deve estar livre. PANEL_PORT altera a porta externa. Use BIND_IP para restringir à interface LAN desejada. Com proxy HTTPS, use COOKIE_SECURE=true e acesse apenas o endereço HTTPS. Não exponha diretamente a porta na internet.
@@ -66,7 +66,7 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 - A classificação é uma heurística configurável, não previsão de vendas ou comissão garantida.
 - Concorrência de vídeos e quantidade de avaliações não são coletadas; valide manualmente.
 - A consulta atual da Open API traz o nome do produto. Título, legenda e prompt usam esse nome e não inventam especificações que a consulta não fornece.
-- A descoberta de categorias lê até três páginas de amostra ordenadas por vendas; a coleta completa depois pagina apenas a categoria escolhida. Se essa busca ainda exceder o limite configurado, a execução falha em vez de enviar ranking parcial.
+- A coleta lê até o limite de páginas configurado, ordenadas por comissão. O ranking considera os produtos encontrados nesse intervalo, não o catálogo inteiro da Shopee. Aumente o limite ou use uma palavra-chave se faltarem anúncios inéditos.
 - Histórico registra ofertas elegíveis observadas; não é histórico completo do catálogo.
 - Logs recentes ficam limitados a 1.000 eventos. Consultas/ofertas são mantidas no SQLite para preservar histórico.
 - Um único processo/container deve usar o banco. Não escale réplicas.

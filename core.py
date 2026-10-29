@@ -24,8 +24,6 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 max_pages=100, page_limit=20)
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
-CATEGORY_SAMPLE_PAGES = 3
-CATEGORY_COOLDOWN_DAYS = 5
 
 
 def utcnow():
@@ -60,7 +58,7 @@ def safe_error(error):
 
 
 def validate_settings(payload, existing=None):
-    # Ignore category_id left by older versions; category selection is automatic now.
+    # Ignore category_id left by older versions.
     result = dict(DEFAULTS)
     result.update({key: value for key, value in (existing or {}).items() if key in DEFAULTS})
     if not isinstance(payload, dict) or set(payload) - set(DEFAULTS):
@@ -115,12 +113,6 @@ class Store:
                 CREATE TABLE IF NOT EXISTS shopee (id INTEGER PRIMARY KEY CHECK(id=1), app_id TEXT, secret TEXT);
                 CREATE TABLE IF NOT EXISTS telegram (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, chat_id TEXT, thread_id TEXT);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS category_rotation (
-                    id INTEGER PRIMARY KEY CHECK(id=1), last_category TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS category_queue (
-                    id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS category_usage (
-                    day TEXT NOT NULL, category TEXT NOT NULL, PRIMARY KEY(day, category));
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY, started TEXT, finished TEXT, status TEXT,
                     source TEXT, settings TEXT, warning TEXT, error TEXT, scanned INTEGER DEFAULT 0,
@@ -151,11 +143,6 @@ class Store:
             migrated_settings = validate_settings({}, stored_settings)
             if migrated_settings != stored_settings:
                 db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(migrated_settings),))
-            for past in db.execute("SELECT started,settings FROM runs WHERE status='ready'"):
-                category = json.loads(past["settings"]).get("rotation_category")
-                if category:
-                    day = datetime.fromisoformat(past["started"]).astimezone(TZ).date().isoformat()
-                    db.execute("INSERT OR IGNORE INTO category_usage VALUES(?,?)", (day, str(category)))
             # A process crash during delivery is ambiguous; never automatically resend it.
             db.execute("UPDATE runs SET delivery='unknown' WHERE delivery='sending'")
             db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status='running'", (utcnow(),))
@@ -184,66 +171,6 @@ class Store:
             db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(value),))
         self.log("info", "Configurações atualizadas.")
         return value
-
-    def category_queue(self):
-        with self.db() as db:
-            row = db.execute("SELECT body,custom FROM category_queue WHERE id=1").fetchone()
-            queue = json.loads(row["body"]) if row else []
-            used = {r["category"]: r["day"] for r in db.execute(
-                "SELECT category,MAX(day) day FROM category_usage GROUP BY category")}
-            last = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
-        return dict(queue=queue, custom=bool(row["custom"]) if row else False,
-                    last_category=last[0] if last else None, last_used=used)
-
-    def save_category_queue(self, categories):
-        if (not isinstance(categories, list) or len(categories) < 6 or len(categories) > 50
-                or any(not isinstance(c, str) or not c.isdigit() or not 0 < int(c) <= 2147483647 for c in categories)
-                or len(set(categories)) != len(categories)):
-            raise ValueError("Informe de 6 a 50 IDs de categorias válidos, sem repetição.")
-        with self.db() as db:
-            db.execute("INSERT INTO category_queue VALUES(1,?,1) ON CONFLICT(id) DO UPDATE SET body=excluded.body,custom=1",
-                       (json.dumps(categories),))
-        self.log("info", "Fila de categorias atualizada.")
-        return self.category_queue()
-
-    def next_category(self, categories, now=None):
-        """Choose an eligible category; successful collections advance the queue."""
-        categories = list(dict.fromkeys(str(c) for c in categories if c))
-        day = (now or datetime.now(TZ)).astimezone(TZ).date()
-        with self.db() as db:
-            row = db.execute("SELECT body,custom FROM category_queue WHERE id=1").fetchone()
-            queue = json.loads(row["body"]) if row else []
-            if not row or not row["custom"]:
-                queue = list(dict.fromkeys([*queue, *categories]))[:50]
-                db.execute("INSERT INTO category_queue VALUES(1,?,0) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
-                           (json.dumps(queue),))
-            last_row = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
-            last = last_row[0] if last_row else None
-            usage = {r["category"]: r["day"] for r in db.execute(
-                "SELECT category,MAX(day) day FROM category_usage GROUP BY category")}
-        if not queue:
-            return None
-        start = (queue.index(last) + 1) % len(queue) if last in queue else 0
-        for offset in range(len(queue)):
-            category = queue[(start + offset) % len(queue)]
-            used = usage.get(category)
-            if not used or (day - datetime.fromisoformat(used).date()).days > CATEGORY_COOLDOWN_DAYS:
-                return category
-        raise ValueError("Todas as categorias da fila foram usadas nos últimos 5 dias. Adicione mais categorias à fila ou aguarde a liberação.")
-
-    def remember_category(self, category, now=None):
-        if category:
-            with self.db() as db:
-                db.execute("INSERT INTO category_rotation VALUES(1,?) ON CONFLICT(id) DO UPDATE SET last_category=excluded.last_category",
-                           (str(category),))
-                day = (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
-                db.execute("INSERT OR IGNORE INTO category_usage VALUES(?,?)", (day, str(category)))
-
-    def rotate_category(self, categories):
-        """Advance through the current best-selling category candidates."""
-        category = self.next_category(categories)
-        self.remember_category(category)
-        return category
 
     def log(self, level, message):
         with self.db() as db:
@@ -349,28 +276,14 @@ class Store:
                 WHERE o.product_key=? ORDER BY r.id DESC LIMIT 60""", (key,))]
 
 
-def product_category_id(node):
-    categories = node.get("productCatIds") or []
-    for value in reversed(categories):
-        category = str(value).strip()
-        if category.isdigit() and 0 < int(category) <= 2147483647:
-            return category
-    return ""
-
-
-def shopee_query(settings, page, category_id=None, sort_type=5):
+def shopee_query(settings, page, sort_type=5):
     args = ["listType: 0", f"sortType: {sort_type}", f"page: {page}", f"limit: {settings['page_limit']}"]
-    if category_id:
-        category = str(category_id).strip()
-        if not category.isdigit() or not 0 < int(category) <= 2147483647:
-            raise ValueError("Categoria automática inválida.")
-        args.append(f"productCatId: {int(category)}")
     if settings["keyword"]:
         args.append("keyword: " + json.dumps(settings["keyword"], ensure_ascii=False))
     return """query { productOfferV2(%s) {
       nodes { itemId shopId productName shopName offerLink price priceMin priceMax
         commission commissionRate appExistRate appNewRate ratingStar sales
-        productCatIds periodStartTime periodEndTime }
+        periodStartTime periodEndTime }
       pageInfo { page hasNextPage }
     } }""" % ", ".join(args)
 
@@ -382,9 +295,9 @@ def request_json(url, body, headers=None):
         return json.load(response)
 
 
-def fetch_product_page(settings, page, credentials, category_id=None, sort_type=5):
+def fetch_product_page(settings, page, credentials, sort_type=5):
     app_id, secret = credentials["app_id"], credentials["secret"]
-    body = json.dumps({"query": shopee_query(settings, page, category_id, sort_type)},
+    body = json.dumps({"query": shopee_query(settings, page, sort_type)},
                       ensure_ascii=False, separators=(",", ":")).encode()
     for attempt in range(3):
         timestamp = str(int(time.time()))
@@ -411,7 +324,7 @@ def fetch_product_page(settings, page, credentials, category_id=None, sort_type=
     return data
 
 
-def fetch_offer_pages(settings, credentials=None, category_id=None, sort_type=5,
+def fetch_offer_pages(settings, credentials=None, sort_type=5,
                       max_pages=None, require_complete=True):
     credentials = credentials or dict(app_id=os.environ.get("SHOPEE_APP_ID"), secret=os.environ.get("SHOPEE_SECRET"))
     app_id, secret = credentials["app_id"], credentials["secret"]
@@ -420,30 +333,22 @@ def fetch_offer_pages(settings, credentials=None, category_id=None, sort_type=5,
     page_count = settings["max_pages"] if max_pages is None else max_pages
     all_nodes, complete = [], False
     for page in range(1, page_count + 1):
-        data = fetch_product_page(settings, page, credentials, category_id, sort_type)
+        data = fetch_product_page(settings, page, credentials, sort_type)
         all_nodes.extend(data["nodes"])
         if not (data.get("pageInfo") or {}).get("hasNextPage"):
             complete = True
             break
     if require_complete and not complete:
-        scope = f" na categoria {category_id}" if category_id else ""
-        raise ValueError(f"Limite de páginas atingido{scope}. Restrinja o nicho ou aumente o limite; ranking incompleto não foi enviado.")
+        raise ValueError("Limite de páginas atingido. Restrinja o nicho ou aumente o limite; ranking incompleto não foi enviado.")
     return all_nodes
 
 
-def fetch_category_sample(settings, credentials=None):
-    """Read a small sales-sorted sample to choose a category before the full collection."""
-    sample_pages = min(CATEGORY_SAMPLE_PAGES, settings["max_pages"])
-    return fetch_offer_pages(settings, credentials, sort_type=2, max_pages=sample_pages,
-                             require_complete=False)
+def fetch_offers(settings, credentials=None):
+    """Rank a bounded product sample; the full Shopee catalog cannot be paginated in one run."""
+    return fetch_offer_pages(settings, credentials, sort_type=5, require_complete=False)
 
 
-def fetch_offers(settings, credentials=None, category_id=None):
-    return fetch_offer_pages(settings, credentials, category_id=category_id,
-                             sort_type=5, require_complete=True)
-
-
-def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=None, strict_category=False):
+def rank_offers(nodes, settings, excluded=None, now=None):
     excluded, now = excluded or set(), now or time.time()
     unique = {}
     for node in nodes:
@@ -471,10 +376,9 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
                            name=str(node.get("productName") or "Produto"), shop=str(node.get("shopName") or ""),
                            price=price, commission=payout, app_existing_rate=rate, app_new_rate=new_rate,
                            commission_basis="cliente existente" if rate > 0 else "comissão informada pela API",
-                           rating=rating, sales=int(sales), category=product_category_id(node),
+                           rating=rating, sales=int(sales),
                            link=link, expires=end if math.isfinite(end) and end > 0 else None)
-    eligible = [p for p in unique.values()
-                if not strict_category or p["category"] == str(preferred_category)]
+    eligible = list(unique.values())
     candidates = [p for p in eligible if p["rating"] >= settings["min_rating"]]
     warning = ""
     if len(candidates) < settings["top_count"] and settings["relax_rating"]:
@@ -492,51 +396,18 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
         p["reasons"] = [f"Comissão estimada R$ {p['commission']:.2f} ({p['commission_basis']})",
                         f"Avaliação {p['rating']:.1f}/5", f"{p['sales']} vendas informadas"]
     candidates.sort(key=lambda p: (-p["score"], p["key"]))
-    selection_order = candidates
-    if preferred_category and not strict_category:
-        selection_order = sorted(candidates, key=lambda p: (p["category"] != preferred_category, -p["score"], p["key"]))
-    selected, categories, shops = [], {}, {}
-    for p in selection_order:
-        cat, shop = p["category"] or "sem_categoria", p["shop_id"]
-        if (not strict_category and categories.get(cat, 0) >= settings.get("per_category", 2)) or shops.get(shop, 0) >= settings["per_shop"]:
+    selected, shops = [], {}
+    for p in candidates:
+        shop = p["shop_id"]
+        if shops.get(shop, 0) >= settings["per_shop"]:
             continue
         selected.append(p["key"])
-        categories[cat] = categories.get(cat, 0) + 1
         shops[shop] = shops.get(shop, 0) + 1
         if len(selected) == settings["top_count"]:
             break
     if len(selected) < settings["top_count"]:
         warning += f" Selecionadas {len(selected)} de {settings['top_count']}; filtros e diversidade foram preservados."
     return candidates, set(selected), warning.strip()
-
-
-def easiest_categories(candidates, limit=20):
-    """Rank available categories by total sampled sales (70%) and average rating (30%)."""
-    if not candidates:
-        return []
-    stats = {}
-    for product in candidates:
-        category = product["category"]
-        if not category:
-            continue
-        stat = stats.setdefault(category, {"sales": 0, "rating": 0.0, "count": 0})
-        stat["sales"] += max(0, number(product["sales"]))
-        stat["rating"] += max(0, min(5, number(product["rating"])))
-        stat["count"] += 1
-    max_sales = max((math.log1p(stat["sales"]) for stat in stats.values()), default=0)
-    scores = {
-        category: 0.7 * (math.log1p(stat["sales"]) / max_sales if max_sales else 0)
-        + 0.3 * (stat["rating"] / stat["count"] / 5)
-        for category, stat in stats.items()
-    }
-    ordered = sorted(scores, key=lambda category: (-scores[category], category))
-    return ordered[:limit]
-
-
-def category_signals(nodes):
-    return [dict(category=product_category_id(node), sales=number(node.get("sales")),
-                 rating=number(node.get("ratingStar")))
-            for node in nodes if product_category_id(node)]
 
 
 def social_copy(product):
@@ -609,16 +480,9 @@ def telegram_text(products):
 
 
 class Engine:
-    def __init__(self, store, fetcher=None, sender=request_json, category_fetcher=None):
+    def __init__(self, store, fetcher=None, sender=request_json):
         self.store, self.sender = store, sender
-        if fetcher is None:
-            self.category_fetcher = category_fetcher or (lambda settings: fetch_category_sample(settings, store.shopee()))
-            self.fetcher = lambda settings, category: fetch_offers(settings, store.shopee(), category)
-            self.category_aware_fetcher = self.fetcher
-        else:
-            self.category_fetcher = category_fetcher
-            self.fetcher = fetcher
-            self.category_aware_fetcher = fetcher if category_fetcher is not None else None
+        self.fetcher = fetcher or (lambda settings: fetch_offers(settings, store.shopee()))
         self.lock = threading.Lock()
         self.heartbeat = time.time()
         self.stop = threading.Event()
@@ -634,31 +498,13 @@ class Engine:
             self.store.log("info", f"Consulta #{run_id} iniciada ({source}).")
             try:
                 excluded = self.store.exclusions()
-                if self.category_fetcher and self.fetcher is self.category_aware_fetcher:
-                    sample_nodes = self.category_fetcher(settings)
-                    unseen_sample = [node for node in sample_nodes
-                                     if f"{node.get('shopId', '')}:{node.get('itemId', '')}" not in excluded]
-                    categories = easiest_categories(category_signals(unseen_sample))
-                    rotation_category = self.store.next_category(categories)
-                    if not rotation_category:
-                        raise ValueError("Não foi possível identificar uma categoria vendável na amostra da Shopee.")
-                    nodes = self.fetcher(settings, rotation_category)
-                    candidates, selected, warning = rank_offers(
-                        nodes, settings, excluded, preferred_category=rotation_category, strict_category=True)
-                else:
-                    # Injected fetchers keep the existing one-call contract for tests and integrations.
-                    nodes = self.fetcher(settings)
-                    discovery, _, _ = rank_offers(nodes, settings, excluded)
-                    rotation_category = self.store.next_category(easiest_categories(discovery))
-                    candidates, selected, warning = rank_offers(
-                        nodes, settings, excluded, preferred_category=rotation_category)
-                run_settings = dict(settings, rotation_category=rotation_category)
+                nodes = self.fetcher(settings)
+                candidates, selected, warning = rank_offers(nodes, settings, excluded)
                 with self.store.db() as db:
                     for product in candidates:
                         db.execute("INSERT INTO offers VALUES(?,?,?,?)", (run_id, product["key"], json.dumps(product), int(product["key"] in selected)))
                     db.execute("UPDATE runs SET settings=?,status='ready',finished=?,scanned=?,warning=? WHERE id=?",
-                               (json.dumps(run_settings), utcnow(), len(nodes), warning, run_id))
-                self.store.remember_category(rotation_category)
+                               (json.dumps(settings), utcnow(), len(nodes), warning, run_id))
                 self.store.log("info", f"Consulta #{run_id}: {len(nodes)} ofertas consultadas, {len(selected)} selecionadas.")
             except Exception as error:
                 with self.store.db() as db:

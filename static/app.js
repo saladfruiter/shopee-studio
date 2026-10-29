@@ -2,7 +2,7 @@
 const $=s=>document.querySelector(s),money=n=>new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(n);
 const date=s=>s?new Date(s).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let state,csrf='',activeRun=null,allOffers=false,sendingRun=null,wasBusy=false,categoryQueueEdited=false;
+let state,csrf='',activeRun=null,allOffers=false,sendingRun=null,wasBusy=false;
 const labels={ready:'Pronta',running:'Consultando',failed:'Falhou',not_sent:'Não enviado',sending:'Enviando',sent:'Confirmado',unknown:'Não confirmado',new:'Ainda não avaliado',planned:'Vou divulgar',published:'Já divulguei',discarded:'Descartar'};
 function toast(message){$('#toast').textContent=message;$('#toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').hidden=true,6500);}
 async function api(path,options={}){
@@ -35,18 +35,13 @@ async function refresh(fillForms=false){
  $('#events').innerHTML=state.events.slice(0,5).map(e=>'<div class="event"><i class="event-dot '+esc(e.level)+'"></i><span>'+esc(e.message)+'</span><time>'+date(e.created)+'</time></div>').join('')||'<p class="muted">As atividades aparecerão aqui após a primeira consulta.</p>';
  $('#weights').innerHTML=[['commission_weight','Comissão'],['rating_weight','Avaliação'],['sales_weight','Vendas']].map(([k,v])=>'<div><strong>'+state.settings[k]+'%</strong><span>'+v+'</span></div>').join('');
  $('#history-body').innerHTML=state.runs.map(r=>'<tr><td>#'+r.id+' · '+date(r.started)+'</td><td>'+(r.source==='scheduled'?'Agendada':'Manual')+'</td><td>'+r.scanned+'</td><td>'+esc(labels[r.status])+'</td><td>'+esc(labels[r.delivery])+'</td><td><button class="secondary" data-run="'+r.id+'">Ver</button></td></tr>').join('')||'<tr><td colspan="6">Nenhuma consulta registrada.</td></tr>';
- const rotation=state.category_rotation;
- $('#current-category').textContent=rotation.last_category?'#'+rotation.last_category:'Ainda não definida';
- $('#category-queue-status').textContent=rotation.queue.length?(rotation.custom?'Fila personalizada':'Fila automática')+' · '+rotation.queue.length+' categorias · Última utilização: '+rotation.queue.map(id=>'#'+id+' '+(rotation.last_used[id]||'ainda não usada')).join(' · '):'A fila será preenchida após a primeira consulta.';
  document.querySelectorAll('[data-run]').forEach(b=>b.onclick=async()=>{try{activeRun=await api('/runs/'+b.dataset.run);allOffers=false;renderOffers();view('overview');}catch(e){toast(e.message);}});
  if(fillForms){$('#shopee-app-id').value=state.shopee_app_id||'';for(const [key,value] of Object.entries(state.settings)){const input=$('#settings-form').elements.namedItem(key);if(input){if(input.type==='checkbox')input.checked=value;else input.value=value;}}$('#telegram-chat').value=state.telegram.chat_id||'';$('#telegram-topic').value=state.telegram.thread_id||'';}
- if(!categoryQueueEdited)$('#category-queue').value=rotation.queue.join('\n');
  $('#telegram-status').textContent=state.telegram.configured?'Bot configurado · chat '+state.telegram.chat_id+(state.telegram.thread_id?' · tópico '+state.telegram.thread_id:' · sem tópico específico'):'Configure seu bot e o destino. Nenhuma mensagem será enviada ao salvar.';
 }
 function renderOffers(){
  const s=activeRun?.settings||state.settings;
- const rotation=activeRun?.settings?.rotation_category;
- $('#filter-summary').innerHTML=[s.keyword||'Todos os nichos',rotation?'Categoria em rodízio · #'+rotation:activeRun?'Categoria não registrada nesta consulta':'Rodízio automático por vendas e avaliação','Nota ≥ '+s.min_rating,s.max_price?'Até '+money(s.max_price):'Sem teto de preço','Enviados não se repetem',activeRun?'Consulta #'+activeRun.id:'Aguardando primeira consulta'].map(v=>'<span>'+esc(v)+'</span>').join('');
+ $('#filter-summary').innerHTML=[s.keyword||'Todos os produtos','Nota ≥ '+s.min_rating,s.max_price?'Até '+money(s.max_price):'Sem teto de preço','Anúncios enviados não se repetem',activeRun?'Consulta #'+activeRun.id:'Aguardando primeira consulta'].map(v=>'<span>'+esc(v)+'</span>').join('');
  $('#run-warning').textContent=activeRun?.error||activeRun?.warning||'';$('#run-warning').hidden=!$('#run-warning').textContent;
  const products=(activeRun?.products||[]).filter(p=>allOffers||p.selected);
  $('#show-all').textContent=allOffers?'Ver seleção':'Ver alternativas';$('#preview').disabled=!activeRun||activeRun.status!=='ready';
@@ -58,8 +53,6 @@ function renderOffers(){
 $('#show-all').onclick=()=>{allOffers=!allOffers;renderOffers();};
 $('#collect').onclick=async()=>{try{await post('/run-now');activeRun=null;toast('Consulta iniciada. Nenhuma mensagem será enviada por esta ação.');await refresh();}catch(e){toast(e.message);}};
 $('#settings-form').onsubmit=async e=>{e.preventDefault();const r={};for(const[k,v]of Object.entries(state.settings)){const i=e.target.elements.namedItem(k);if(!i)continue;r[k]=typeof v==='boolean'?i.checked:typeof v==='number'?Number(i.value):i.value.trim();}try{await post('/settings',r);await refresh(true);toast('Preferências salvas.');}catch(error){toast(error.message);}};
-$('#category-queue').oninput=()=>{categoryQueueEdited=true;};
-$('#category-form').onsubmit=async e=>{e.preventDefault();const queue=$('#category-queue').value.split(/[\s,;]+/).map(s=>s.trim()).filter(Boolean);try{await post('/category-queue',{queue});categoryQueueEdited=false;await refresh(true);toast('Fila de categorias salva.');}catch(error){toast(error.message);}};
 $('#telegram-form').onsubmit=async e=>{e.preventDefault();const r={chat_id:$('#telegram-chat').value.trim(),thread_id:$('#telegram-topic').value.trim(),token:$('#telegram-token').value.trim()};try{await post('/telegram',r);$('#telegram-token').value='';await refresh(true);toast('Telegram salvo. Nenhuma mensagem foi enviada.');}catch(error){toast(error.message);}};
 $('#preview').onclick=async()=>{try{sendingRun=activeRun.id;const p=await api('/runs/'+sendingRun+'/preview');$('#modal-title').textContent='Confira antes de enviar';$('#modal-destination').textContent='Destino: '+(p.destination.chat_id||'não configurado')+(p.destination.thread_id?' · tópico '+p.destination.thread_id:'');$('#modal-content').textContent=p.text.replace('Toque nos botões para copiar título, descrição ou prompt.','O Telegram acrescentará botões para copiar cada texto.');$('#confirm-send').hidden=false;$('#confirm-send').disabled=!p.can_send||!p.destination.configured;$('#modal').showModal();}catch(e){toast(e.message);}};
 $('#confirm-send').onclick=async()=>{$('#confirm-send').disabled=true;try{await post('/runs/'+sendingRun+'/send');$('#modal').close();toast('Entrega confirmada pelo Telegram.');await refresh();}catch(e){toast(e.message);await refresh();}};

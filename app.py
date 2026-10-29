@@ -137,7 +137,6 @@ def create_app(data_dir=None, testing=False):
                 next_run = now
         credentials = store.telegram_public()
         return jsonify(csrf=session["csrf"], runs=runs, settings=settings,
-                       category_rotation=store.category_queue(),
                        latest=store.run(runs[0]["id"]) if runs else None,
                        next_run=next_run.isoformat() if settings["schedule_enabled"] else None,
                        busy=engine.lock.locked(), events=events, counts=counts,
@@ -157,11 +156,6 @@ def create_app(data_dir=None, testing=False):
     @app.post("/api/settings")
     def settings():
         return jsonify(store.save_settings(request.get_json()))
-
-    @app.post("/api/category-queue")
-    def category_queue():
-        body = request.get_json()
-        return jsonify(store.save_category_queue(body.get("queue") if isinstance(body, dict) else None))
 
     @app.post("/api/shopee")
     def shopee_settings():
