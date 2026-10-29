@@ -25,6 +25,7 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
 CATEGORY_SAMPLE_PAGES = 3
+CATEGORY_COOLDOWN_DAYS = 5
 
 
 def utcnow():
@@ -116,6 +117,10 @@ class Store:
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS category_rotation (
                     id INTEGER PRIMARY KEY CHECK(id=1), last_category TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS category_queue (
+                    id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL, custom INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS category_usage (
+                    day TEXT NOT NULL, category TEXT NOT NULL, PRIMARY KEY(day, category));
                 CREATE TABLE IF NOT EXISTS runs (
                     id INTEGER PRIMARY KEY, started TEXT, finished TEXT, status TEXT,
                     source TEXT, settings TEXT, warning TEXT, error TEXT, scanned INTEGER DEFAULT 0,
@@ -146,6 +151,11 @@ class Store:
             migrated_settings = validate_settings({}, stored_settings)
             if migrated_settings != stored_settings:
                 db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(migrated_settings),))
+            for past in db.execute("SELECT started,settings FROM runs WHERE status='ready'"):
+                category = json.loads(past["settings"]).get("rotation_category")
+                if category:
+                    day = datetime.fromisoformat(past["started"]).astimezone(TZ).date().isoformat()
+                    db.execute("INSERT OR IGNORE INTO category_usage VALUES(?,?)", (day, str(category)))
             # A process crash during delivery is ambiguous; never automatically resend it.
             db.execute("UPDATE runs SET delivery='unknown' WHERE delivery='sending'")
             db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status='running'", (utcnow(),))
@@ -175,21 +185,59 @@ class Store:
         self.log("info", "Configurações atualizadas.")
         return value
 
-    def next_category(self, categories):
-        """Choose the next category without advancing the rotation yet."""
-        categories = list(dict.fromkeys(str(category) for category in categories if category))
-        if not categories:
-            return None
+    def category_queue(self):
         with self.db() as db:
-            row = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
-            last = row[0] if row else None
-        return categories[(categories.index(last) + 1) % len(categories)] if last in categories else categories[0]
+            row = db.execute("SELECT body,custom FROM category_queue WHERE id=1").fetchone()
+            queue = json.loads(row["body"]) if row else []
+            used = {r["category"]: r["day"] for r in db.execute(
+                "SELECT category,MAX(day) day FROM category_usage GROUP BY category")}
+            last = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
+        return dict(queue=queue, custom=bool(row["custom"]) if row else False,
+                    last_category=last[0] if last else None, last_used=used)
 
-    def remember_category(self, category):
+    def save_category_queue(self, categories):
+        if (not isinstance(categories, list) or len(categories) < 6 or len(categories) > 50
+                or any(not isinstance(c, str) or not c.isdigit() or not 0 < int(c) <= 2147483647 for c in categories)
+                or len(set(categories)) != len(categories)):
+            raise ValueError("Informe de 6 a 50 IDs de categorias válidos, sem repetição.")
+        with self.db() as db:
+            db.execute("INSERT INTO category_queue VALUES(1,?,1) ON CONFLICT(id) DO UPDATE SET body=excluded.body,custom=1",
+                       (json.dumps(categories),))
+        self.log("info", "Fila de categorias atualizada.")
+        return self.category_queue()
+
+    def next_category(self, categories, now=None):
+        """Choose an eligible category; successful collections advance the queue."""
+        categories = list(dict.fromkeys(str(c) for c in categories if c))
+        day = (now or datetime.now(TZ)).astimezone(TZ).date()
+        with self.db() as db:
+            row = db.execute("SELECT body,custom FROM category_queue WHERE id=1").fetchone()
+            queue = json.loads(row["body"]) if row else []
+            if not row or not row["custom"]:
+                queue = list(dict.fromkeys([*queue, *categories]))[:50]
+                db.execute("INSERT INTO category_queue VALUES(1,?,0) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
+                           (json.dumps(queue),))
+            last_row = db.execute("SELECT last_category FROM category_rotation WHERE id=1").fetchone()
+            last = last_row[0] if last_row else None
+            usage = {r["category"]: r["day"] for r in db.execute(
+                "SELECT category,MAX(day) day FROM category_usage GROUP BY category")}
+        if not queue:
+            return None
+        start = (queue.index(last) + 1) % len(queue) if last in queue else 0
+        for offset in range(len(queue)):
+            category = queue[(start + offset) % len(queue)]
+            used = usage.get(category)
+            if not used or (day - datetime.fromisoformat(used).date()).days > CATEGORY_COOLDOWN_DAYS:
+                return category
+        raise ValueError("Todas as categorias da fila foram usadas nos últimos 5 dias. Adicione mais categorias à fila ou aguarde a liberação.")
+
+    def remember_category(self, category, now=None):
         if category:
             with self.db() as db:
                 db.execute("INSERT INTO category_rotation VALUES(1,?) ON CONFLICT(id) DO UPDATE SET last_category=excluded.last_category",
                            (str(category),))
+                day = (now or datetime.now(TZ)).astimezone(TZ).date().isoformat()
+                db.execute("INSERT OR IGNORE INTO category_usage VALUES(?,?)", (day, str(category)))
 
     def rotate_category(self, categories):
         """Advance through the current best-selling category candidates."""
@@ -285,14 +333,13 @@ class Store:
                        (token, chat, topic))
         self.log("info", "Destino Telegram atualizado. Token preservado em armazenamento local.")
 
-    def exclusions(self, days):
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    def exclusions(self):
+        """Exclude every offer already sent, or possibly sent, to Telegram."""
         with self.db() as db:
             excluded = {r[0] for r in db.execute("SELECT product_key FROM decisions WHERE state IN ('discarded','published')")}
-            if days:
-                excluded.update(r[0] for r in db.execute("""
-                    SELECT DISTINCT o.product_key FROM offers o JOIN runs r ON r.id=o.run_id
-                    WHERE o.selected=1 AND r.sent_at>=? AND r.delivery='sent'""", (cutoff,)))
+            excluded.update(r[0] for r in db.execute("""
+                SELECT DISTINCT o.product_key FROM offers o JOIN runs r ON r.id=o.run_id
+                WHERE o.selected=1 AND r.delivery IN ('sent','unknown','sending')"""))
             return excluded
 
     def history(self, key):
@@ -434,7 +481,7 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
         candidates = [p for p in eligible if p["rating"] >= settings["fallback_rating"]]
         warning = f"Nota mínima flexibilizada para {settings['fallback_rating']:.1f}, conforme sua configuração."
     if not candidates:
-        raise ValueError("Nenhuma oferta passou pelos filtros e pelo intervalo de repetição.")
+        raise ValueError("Nenhuma oferta inédita passou pelos filtros.")
     max_payout = max(p["commission"] for p in candidates)
     max_sales = max(p["sales"] for p in candidates)
     for p in candidates:
@@ -463,7 +510,7 @@ def rank_offers(nodes, settings, excluded=None, now=None, preferred_category=Non
     return candidates, set(selected), warning.strip()
 
 
-def easiest_categories(candidates, limit=5):
+def easiest_categories(candidates, limit=20):
     """Rank available categories by total sampled sales (70%) and average rating (30%)."""
     if not candidates:
         return []
@@ -586,10 +633,12 @@ class Engine:
                                     (utcnow(), source, json.dumps(settings))).lastrowid
             self.store.log("info", f"Consulta #{run_id} iniciada ({source}).")
             try:
-                excluded = self.store.exclusions(settings["repeat_days"])
+                excluded = self.store.exclusions()
                 if self.category_fetcher and self.fetcher is self.category_aware_fetcher:
                     sample_nodes = self.category_fetcher(settings)
-                    categories = easiest_categories(category_signals(sample_nodes))
+                    unseen_sample = [node for node in sample_nodes
+                                     if f"{node.get('shopId', '')}:{node.get('itemId', '')}" not in excluded]
+                    categories = easiest_categories(category_signals(unseen_sample))
                     rotation_category = self.store.next_category(categories)
                     if not rotation_category:
                         raise ValueError("Não foi possível identificar uma categoria vendável na amostra da Shopee.")
@@ -621,7 +670,7 @@ class Engine:
             self.lock.release()
 
     def sendable_products(self, run):
-        excluded = self.store.exclusions(run["settings"]["repeat_days"])
+        excluded = self.store.exclusions()
         return [p for p in run["products"] if p["selected"] and p["key"] not in excluded
                 and p["decision"] not in ("discarded", "published")]
 
@@ -667,7 +716,7 @@ class Engine:
                 raise ValueError("Entrega não confirmada; confira o Telegram. Não haverá reenvio automático.") from None
             with self.store.db() as db:
                 db.execute("UPDATE runs SET delivery='sent',sent_at=?,message_id=? WHERE id=?", (utcnow(), message_id, run_id))
-                # Only actually delivered products count towards repetition.
+                # Only products in the confirmed message are permanently excluded.
                 delivered = {p["key"] for p in products}
                 for p in run["products"]:
                     if p["selected"] and p["key"] not in delivered:

@@ -77,6 +77,26 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(len(self.store.history("1:1")),1)
         self.assertEqual(Store(self.temp.name).runs()[0]["id"],run_id)
 
+    def test_category_cooldown_and_persisted_queue(self):
+        day=datetime(2026,10,1,12,tzinfo=TZ)
+        categories=[str(i) for i in range(1,7)]
+        self.store.save_category_queue(categories)
+        for offset in range(6):
+            now=day+timedelta(days=offset)
+            category=self.store.next_category(categories,now)
+            self.assertEqual(category,categories[offset])
+            self.store.remember_category(category,now)
+        self.assertEqual(Store(self.temp.name).next_category(categories,day+timedelta(days=6)),"1")
+        with self.assertRaisesRegex(ValueError,"últimos 5 dias"):
+            self.store.next_category(categories,day+timedelta(days=5))
+
+    def test_custom_queue_order_and_validation(self):
+        self.store.save_category_queue(["6","5","4","3","2","1"])
+        self.assertEqual(self.store.next_category(["7","8"]),"6")
+        self.assertEqual(self.store.category_queue()["queue"],["6","5","4","3","2","1"])
+        with self.assertRaises(ValueError):
+            self.store.save_category_queue(["1","1","2","3","4","5"])
+
     def test_topic_payload_and_duplicate_delivery_guard(self):
         captured=[]
         self.engine.sender=lambda url,body: captured.append(json.loads(body)) or {"ok":True,"result":{"message_id":10}}
@@ -84,7 +104,7 @@ class EngineTest(unittest.TestCase):
         self.engine.send(run_id)
         self.assertEqual(captured[0]["message_thread_id"],42)
         self.assertEqual(captured[0]["chat_id"],"-1001234")
-        self.assertEqual(len(self.store.exclusions(7)),5)
+        self.assertEqual(len(self.store.exclusions()),5)
         with self.assertRaises(ValueError):
             self.engine.send(run_id)
         self.assertEqual(len(captured),1)
@@ -96,6 +116,29 @@ class EngineTest(unittest.TestCase):
         self.engine.send(first)
         with self.assertRaisesRegex(ValueError,"Nenhuma oferta"):
             self.engine.send(second)
+
+    def test_old_sent_offers_never_return_to_selection(self):
+        self.engine.sender=lambda url,body: {"ok":True,"result":{"message_id":10}}
+        first=self.engine.collect()
+        sent={p["key"] for p in self.store.run(first)["products"] if p["selected"]}
+        self.engine.send(first)
+        with self.store.db() as db:
+            db.execute("UPDATE runs SET sent_at=? WHERE id=?",
+                       ((datetime.now(timezone.utc)-timedelta(days=400)).isoformat(),first))
+        self.store.save_settings({"repeat_days":0})
+        second=self.engine.collect()
+        found={p["key"] for p in self.store.run(second)["products"]}
+        self.assertFalse(sent & found)
+        self.assertEqual(len(found),1)
+
+    def test_uncertain_delivery_is_not_recommended_again(self):
+        self.engine.sender=lambda url,body: (_ for _ in ()).throw(TimeoutError())
+        first=self.engine.collect()
+        selected={p["key"] for p in self.store.run(first)["products"] if p["selected"]}
+        with self.assertRaises(ValueError):
+            self.engine.send(first)
+        second=self.engine.collect()
+        self.assertFalse(selected & {p["key"] for p in self.store.run(second)["products"]})
 
     def test_unknown_delivery_never_retried(self):
         def fail(url,body):
@@ -176,6 +219,13 @@ class ApiTest(unittest.TestCase):
         state=self.client.get("/api/state")
         self.assertNotIn(token,state.get_data(as_text=True))
         self.assertEqual(state.json["telegram"]["thread_id"],"12")
+
+    def test_category_queue_api(self):
+        headers=self.login()
+        queue=[str(i) for i in range(1,7)]
+        result=self.client.post("/api/category-queue",json={"queue":queue},headers=headers)
+        self.assertEqual(result.status_code,200)
+        self.assertEqual(self.client.get("/api/state").json["category_rotation"]["queue"],queue)
     def test_shopee_secret_never_returned(self):
         headers=self.login()
         secret="unit-test-shopee-secret"
