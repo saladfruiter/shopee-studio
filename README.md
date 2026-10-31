@@ -13,10 +13,17 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 - Histórico de consultas, preços observados, decisões e entregas; SQLite persiste nas atualizações.
 - Consulta manual apenas prepara a prévia. Envio manual exige confirmar no painel.
 - Configuração do Telegram pela interface: token, chat/grupo e tópico (message_thread_id). Token vazio preserva o já salvo; tópico vazio remove o destino de tópico.
-- Cada oferta enviada inclui título de vídeo, descrição curta com hashtags e prompt de 8 segundos para Google Flow. Botões do Telegram copiam cada texto com um toque.
+- Para cada produto selecionado, busca anúncios do mesmo produto (uma página extra da API por produto) e pede a um modelo de visão para comparar imagem e atributos: marca/modelo, variante/cor, tamanho/capacidade, acessórios e kit. Só os classificados como "mesmo produto" viram links; incertos e diferentes ficam de fora, com o motivo visível no painel. Cada produto sai com até 6 links: o selecionado e até 5 equivalentes, numa lista única.
+- O mesmo modelo escreve a legenda (frase + 2 ou 3 hashtags, no máximo 150 caracteres no total) e o roteiro de 10 segundos (gancho, demonstração, benefício, chamada e narração). O código confere a contagem de caracteres (UTF-16), as hashtags proibidas (#Shopee, #Achadinhos, #Viral, #Fyp…), emojis, reticências e promessas de preço, desconto, frete ou urgência. Resposta fora das regras volta ao modelo para correção. Não há título de vídeo separado.
+- Modelo configurável em Preferências: principal + fallbacks em ordem. Padrão de fábrica: Antigravity CLI (agy) com gemini-3.8-flash-medium e gemini-4-argon-medium como fallback, executados pelo worker da VM (veja worker/README.md). Também aceita endpoints OpenAI-compatíveis (OpenRouter, llama.cpp) com chave protegida, modelo visual e modelo de texto opcional. Ajuste ali o tempo limite, as novas tentativas e quantos candidatos são comparados. O botão Testar visão manda uma imagem real ao modelo. Se todos os modelos falharem, o produto sai com o próprio link e um texto automático marcado como "sem validação do modelo".
+- No Telegram, cada produto vira uma mensagem com a foto do anúncio (o painel baixa a imagem original e envia ao Telegram, que aplica a compressão normal de fotos), a identificação, a legenda num bloco copiável e os links. O prompt do Google Flow chega em outro bloco copiável, como resposta a essa mensagem. Não há botões de cópia.
 - Agenda diariamente em America/Sao_Paulo, recupera o horário perdido do dia ao reiniciar e tenta falhas novamente após 5 e 10 minutos.
 - Entrega incerta não é repetida automaticamente: confira o Telegram. Não há garantia de exactly-once na API do Telegram.
 - Login no painel, proteção CSRF e limitação de tentativas de login. Segredos ficam fora do Git e da imagem.
+
+## Worker da VM
+
+O Antigravity CLI só existe logado na VM hermes, então o painel não o chama direto. Um worker na VM busca as tarefas pelo endpoint /api/worker/*, autenticado por um token gerado em Preferências → Worker da VM, e devolve o resultado. Instalação e operação: worker/README.md. Sem o worker, os modelos agy são pulados na hora e a cadeia segue para os fallbacks.
 
 ## Unraid / Compose Manager
 
@@ -65,7 +72,9 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 
 - A classificação é uma heurística configurável, não previsão de vendas ou comissão garantida.
 - Concorrência de vídeos e quantidade de avaliações não são coletadas; valide manualmente.
-- A consulta atual da Open API traz o nome do produto. Título, legenda e prompt usam esse nome e não inventam especificações que a consulta não fornece.
+- A Open API traz nome, uma imagem, loja e preços, mas não as especificações nem as variantes do anúncio. A comparação de equivalentes depende dessa imagem e do título. Por isso, na dúvida, o modelo deve marcar "incerto". Confira os links antes de vincular ao vídeo: a elegibilidade e a comissão no canal Vídeo não são verificadas.
+- Anúncios equivalentes já enviados também ficam excluídos das próximas consultas, para não gerar outro vídeo do mesmo produto.
+- Uma consulta com análise leva cerca de 1 minuto por produto com o agy. O painel mostra o progresso. Produtos analisados no momento de um reinício são descartados, e a consulta fica como falha.
 - A coleta lê até o limite de páginas configurado, ordenadas por comissão. O ranking considera os produtos encontrados nesse intervalo, não o catálogo inteiro da Shopee. Aumente o limite ou use uma palavra-chave se faltarem anúncios inéditos.
 - Histórico registra ofertas elegíveis observadas; não é histórico completo do catálogo.
 - Logs recentes ficam limitados a 1.000 eventos. Consultas/ofertas são mantidas no SQLite para preservar histórico.

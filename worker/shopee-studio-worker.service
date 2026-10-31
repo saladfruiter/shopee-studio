@@ -1,0 +1,15 @@
+[Unit]
+Description=Shopee Studio worker (Antigravity CLI tasks for the panel)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/shopee-studio-worker/studio_worker.py
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=20
+# The worker only needs its config, its scratch folder and the agy login.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

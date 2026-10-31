@@ -8,6 +8,29 @@ from core import DEFAULTS, Engine, Store, TZ, fetch_offers, rank_offers, shopee_
 from app import create_app
 
 
+def good_output(count=0, verdicts=None):
+    verdicts = verdicts or {}
+    return dict(equivalents=[dict(id=f"C{i}", verdict=verdicts.get(i, "incompatible"), reason="motivo")
+                             for i in range(1, count + 1)],
+                description="Mantém os alimentos frescos e a geladeira organizada",
+                hashtags=["#PoteHermetico", "#CozinhaOrganizada"],
+                hook="Close do pote sendo fechado com um clique", demo="Mão enche o pote e fecha a tampa",
+                benefit="Alimentos frescos por mais tempo", cta="Pessoa aponta para o produto do vídeo",
+                narration="Olha que prático: fecha com um clique e mantém tudo fresco. Toque no produto do vídeo.")
+
+
+class FakeRunner:
+    def __init__(self, output=None, error=None):
+        self.output, self.error, self.calls = output or good_output(), error, []
+    def run(self, prompt, schema, images, check, log=None):
+        self.calls.append(dict(prompt=prompt, images=images))
+        if self.error:
+            raise self.error
+        output = self.output(images) if callable(self.output) else self.output
+        assert check(output) == [], check(output)
+        return output, "Fake", ["Fake: ok"]
+
+
 def node(i=1, **overrides):
     value=dict(itemId=i,shopId=i,productName=f"Produto {i}",shopName=f"Loja {i}",
                offerLink=f"https://shopee.com.br/product/{i}/{i}",price="50",
@@ -69,7 +92,11 @@ class EngineTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store=Store(self.temp.name)
         self.store.save_settings(dict(schedule_enabled=True,auto_send=False))
-        self.engine=Engine(self.store,fetcher=lambda _: [node(i) for i in range(1,7)])
+        sleeper=patch("core.time.sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
+        self.engine=Engine(self.store,fetcher=lambda _: [node(i) for i in range(1,7)],
+                           searcher=lambda *args: [],runner=FakeRunner())
         self.store.save_telegram(dict(token="123456:"+("A"*30),chat_id="-1001234",thread_id="42"))
 
     def test_preview_does_not_send_and_history_persists(self):
@@ -83,12 +110,15 @@ class EngineTest(unittest.TestCase):
         self.engine.sender=lambda url,body: captured.append(json.loads(body)) or {"ok":True,"result":{"message_id":10}}
         run_id=self.engine.collect()
         self.engine.send(run_id)
-        self.assertEqual(captured[0]["message_thread_id"],42)
-        self.assertEqual(captured[0]["chat_id"],"-1001234")
+        # One message per product plus its prompt as a reply; every one goes to the topic.
+        self.assertEqual(len(captured),10)
+        self.assertTrue(all(c["message_thread_id"]==42 and c["chat_id"]=="-1001234" for c in captured))
+        self.assertTrue(all("reply_markup" not in c for c in captured))
+        self.assertEqual(captured[1]["reply_parameters"]["message_id"],10)
         self.assertEqual(len(self.store.exclusions()),5)
         with self.assertRaises(ValueError):
             self.engine.send(run_id)
-        self.assertEqual(len(captured),1)
+        self.assertEqual(len(captured),10)
 
     def test_two_previews_cannot_send_same_products(self):
         self.engine.sender=lambda url,body: {"ok":True,"result":{"message_id":10}}
@@ -118,8 +148,13 @@ class EngineTest(unittest.TestCase):
         selected={p["key"] for p in self.store.run(first)["products"] if p["selected"]}
         with self.assertRaises(ValueError):
             self.engine.send(first)
+        # Only the product whose message timed out is uncertain; the others were never attempted.
+        uncertain={k for k,d in self.store.deliveries(first).items() if d["state"]=="unknown"}
+        self.assertEqual(len(uncertain),1)
         second=self.engine.collect()
-        self.assertFalse(selected & {p["key"] for p in self.store.run(second)["products"]})
+        found={p["key"] for p in self.store.run(second)["products"]}
+        self.assertFalse(uncertain & found)
+        self.assertEqual(len((selected-uncertain) & found),4)
 
     def test_unknown_delivery_never_retried(self):
         def fail(url,body):
@@ -146,7 +181,7 @@ class EngineTest(unittest.TestCase):
         selected=next(p for p in self.store.run(run_id)["products"] if p["selected"])
         self.store.decision(selected["key"],"discarded")
         self.engine.send(run_id)
-        self.assertNotIn(selected["link"],captured[0]["text"])
+        self.assertFalse(any(selected["link"] in c["text"] for c in captured))
 
     def test_schedule_restarts_and_catches_up_once(self):
         now=datetime(2026,10,10,13,0,tzinfo=TZ)
@@ -182,6 +217,8 @@ class ApiTest(unittest.TestCase):
             self.app=create_app(self.temp.name,testing=True)
         self.client=self.app.test_client()
         self.app.extensions["engine"].fetcher=lambda _: [node()]
+        self.app.extensions["engine"].searcher=lambda *args: []
+        self.app.extensions["engine"].runner=FakeRunner()
     def login(self):
         result=self.client.post("/api/login",json={"password":"test-password-only"})
         self.assertEqual(result.status_code,200)

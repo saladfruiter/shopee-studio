@@ -2,6 +2,7 @@
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -11,7 +12,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
-from core import Engine, Store, TZ, load_env, safe_error, telegram_text
+from core import Engine, Store, TZ, load_env, safe_error, telegram_preview
+from llm import public_llm
 
 ROOT = Path(__file__).parent
 load_env(ROOT / ".env")
@@ -31,7 +33,7 @@ def create_app(data_dir=None, testing=False):
     app.config.update(SECRET_KEY=secret_file.read_text().strip(), TESTING=testing,
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict",
                       SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "false") == "true",
-                      PERMANENT_SESSION_LIFETIME=timedelta(hours=12), MAX_CONTENT_LENGTH=16384)
+                      PERMANENT_SESSION_LIFETIME=timedelta(hours=12), MAX_CONTENT_LENGTH=65536)
     store = Store(directory)
     engine = Engine(store)
     app.extensions.update(store=store, engine=engine)
@@ -39,12 +41,21 @@ def create_app(data_dir=None, testing=False):
     password_hash = generate_password_hash(password) if password else ""
     login_attempts = {}
     auth_lock = threading.Lock()
+    model_tests, tests_lock = {}, threading.Lock()
 
     @app.before_request
     def guard():
         if request.path == "/healthz" or request.path.startswith("/static/"):
             return None
         if request.path == "/":
+            return None
+        if request.path.startswith("/api/worker/"):
+            # The VM worker uses its own bearer token; no browser session or CSRF.
+            supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            if not store.check_worker_token(supplied):
+                return jsonify(error="Token do worker inválido."), 401
+            if request.method != "GET" and not request.is_json:
+                return jsonify(error="Requisição JSON obrigatória."), 415
             return None
         if not password_hash and not testing:
             return jsonify(error="Defina PANEL_PASSWORD no .env e reinicie o serviço."), 503
@@ -67,7 +78,7 @@ def create_app(data_dir=None, testing=False):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://*.susercontent.com https://cf.shopee.com.br; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         return response
 
     @app.errorhandler(ValueError)
@@ -143,6 +154,7 @@ def create_app(data_dir=None, testing=False):
                        telegram=credentials, schedule=dict(slot) if slot else None,
                        shopee_configured=bool(store.shopee()["app_id"] and store.shopee()["secret"]),
                        shopee_app_id=store.shopee()["app_id"],
+                       llm=public_llm(store.llm()), worker=store.worker_status(),
                        version=os.environ.get("APP_VERSION", "local"))
 
     @app.get("/api/runs/<int:run_id>")
@@ -190,12 +202,84 @@ def create_app(data_dir=None, testing=False):
     def preview(run_id):
         run = store.run(run_id)
         products = engine.sendable_products(run)
-        return jsonify(text=telegram_text(products), destination=store.telegram_public(),
+        return jsonify(**telegram_preview(products), destination=store.telegram_public(),
                        can_send=run["status"] == "ready" and run["delivery"] == "not_sent" and bool(products))
 
     @app.post("/api/runs/<int:run_id>/send")
     def send(run_id):
         return jsonify(message_id=engine.send(run_id))
+
+    @app.post("/api/llm")
+    def llm_settings():
+        return jsonify(store.save_llm(request.get_json()))
+
+    @app.post("/api/llm/test")
+    def llm_test():
+        provider_id = (request.get_json() or {}).get("provider_id")
+        if not isinstance(provider_id, str):
+            raise ValueError("Informe o modelo a testar.")
+        test_id = secrets.token_hex(8)
+        with tests_lock:
+            for old in [k for k, v in model_tests.items() if time.time() - v["created"] > 3600]:
+                model_tests.pop(old)
+            model_tests[test_id] = dict(status="running", message="Testando visão…", created=time.time())
+        def work():
+            try:
+                message, status = engine.runner.test(provider_id), "ok"
+            except Exception as error:
+                message, status = "Falhou: " + safe_error(error), "failed"
+            with tests_lock:
+                model_tests[test_id].update(status=status, message=message)
+            store.log("info" if status == "ok" else "error", "Teste de modelo — " + message)
+        threading.Thread(target=work, daemon=True).start()
+        return jsonify(test_id=test_id), 202
+
+    @app.get("/api/llm/tests/<test_id>")
+    def llm_test_status(test_id):
+        with tests_lock:
+            test = model_tests.get(test_id)
+        if not test:
+            raise ValueError("Teste não encontrado.")
+        return jsonify(status=test["status"], message=test["message"])
+
+    @app.post("/api/worker-token")
+    def worker_token():
+        return jsonify(token=store.set_worker_token())
+
+    def worker_identity(body):
+        worker_id = body.get("worker_id") if isinstance(body, dict) else None
+        if not isinstance(worker_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", worker_id):
+            raise ValueError("worker_id inválido.")
+        return worker_id
+
+    @app.post("/api/worker/claim")
+    def worker_claim():
+        body = request.get_json()
+        worker_id = worker_identity(body)
+        kinds = body.get("kinds")
+        if not isinstance(kinds, list) or not kinds or not all(k in ("llm",) for k in kinds):
+            raise ValueError("kinds inválido.")
+        version = str(body.get("version", ""))[:40]
+        store.worker_seen(worker_id, version, kinds)
+        task = store.claim_task(worker_id, kinds)
+        return (jsonify(task=task), 200) if task else (jsonify(task=None), 200)
+
+    @app.post("/api/worker/heartbeat")
+    def worker_heartbeat():
+        store.worker_touch(worker_identity(request.get_json()))
+        return jsonify(ok=True)
+
+    @app.post("/api/worker/tasks/<int:task_id>/result")
+    def worker_result(task_id):
+        body = request.get_json()
+        worker_id = worker_identity(body)
+        store.worker_touch(worker_id)
+        if type(body.get("ok")) is not bool:
+            raise ValueError("ok deve ser verdadeiro ou falso.")
+        output = body.get("output")
+        store.finish_task(task_id, worker_id, body["ok"], dict(output=output) if body["ok"] else None,
+                          str(body.get("error", ""))[:500])
+        return jsonify(ok=True)
 
     if not testing:
         engine.start()
