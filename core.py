@@ -18,6 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import analysis
+import video as video_module
 from content import plain, product_messages
 from llm import LLM_DEFAULTS, ModelError, Runner, WORKER_ONLINE_SECONDS, fetch_image, public_llm, validate_llm
 
@@ -27,7 +28,9 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 min_commission=0.0, repeat_days=7, per_shop=2,
                 top_count=5, commission_weight=50, rating_weight=30, sales_weight=20,
                 schedule_time="12:00", schedule_enabled=True, auto_send=False,
-                max_pages=100, page_limit=20)
+                max_pages=100, page_limit=20,
+                video_enabled=True, video_daily_credits=75, video_cost=15, video_model="Omni 1.1 Flash",
+                flow_project_url="")
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
 
@@ -85,6 +88,12 @@ def validate_settings(payload, existing=None):
         elif not isinstance(value, str):
             raise ValueError(f"{key}: texto inválido.")
         result[key] = value
+    if not 1 <= len(result["video_model"].strip()) <= 60:
+        raise ValueError("Modelo de vídeo: informe o nome mostrado no Flow (até 60 caracteres).")
+    result["video_model"] = result["video_model"].strip()
+    result["flow_project_url"] = result["flow_project_url"].strip()
+    if result["flow_project_url"] and not re.fullmatch(r"https://(flow\.google\.com|labs\.google)/\S{3,280}", result["flow_project_url"]):
+        raise ValueError("URL do projeto do Flow inválida (https://flow.google.com/project/...).")
     if len(result["keyword"]) > 120:
         raise ValueError("Palavra-chave: máximo de 120 caracteres.")
     try:
@@ -100,7 +109,8 @@ def validate_settings(payload, existing=None):
         raise ValueError("Preço máximo menor que o mínimo.")
     for key, low, high in (("repeat_days", 0, 365), ("top_count", 1, 10),
                            ("per_shop", 1, 10),
-                           ("max_pages", 1, 500), ("page_limit", 1, 50)):
+                           ("max_pages", 1, 500), ("page_limit", 1, 50),
+                           ("video_daily_credits", 0, 2000), ("video_cost", 1, 500)):
         if not low <= result[key] <= high:
             raise ValueError(f"{key}: use {low} a {high}.")
     weights = [result[k] for k in ("commission_weight", "rating_weight", "sales_weight")]
@@ -142,6 +152,13 @@ class Store:
                     id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, status TEXT, created TEXT,
                     deadline REAL, worker_id TEXT, claimed_at TEXT, finished TEXT, result TEXT, error TEXT);
                 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status,kind,id);
+                CREATE TABLE IF NOT EXISTS videos (
+                    id INTEGER PRIMARY KEY, run_id INTEGER, product_key TEXT, day TEXT, state TEXT, task_id INTEGER,
+                    credits INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, photo_message_id INTEGER, message_id INTEGER,
+                    file TEXT, meta TEXT, error TEXT, created TEXT, updated TEXT);
+                CREATE INDEX IF NOT EXISTS videos_run ON videos(run_id, product_key);
+                CREATE INDEX IF NOT EXISTS videos_task ON videos(task_id);
+                CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS deliveries (
                     run_id INTEGER, product_key TEXT, state TEXT, photo_message_id INTEGER,
                     text_message_id INTEGER, sent_at TEXT, error TEXT, PRIMARY KEY(run_id, product_key));
@@ -168,8 +185,9 @@ class Store:
             db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status IN ('running','analyzing')", (utcnow(),))
             db.execute("UPDATE schedule SET status='retry', next_retry=0 WHERE status='running'")
             db.execute("UPDATE deliveries SET state='unknown' WHERE state='sending'")
-            # Nobody waits for tasks created before a restart.
-            db.execute("UPDATE tasks SET status='expired' WHERE status IN ('queued','claimed')")
+            # Nobody waits for model tasks created before a restart; video jobs live on their own.
+            db.execute("UPDATE tasks SET status='expired' WHERE kind='llm' AND status IN ('queued','claimed')")
+            db.execute("UPDATE videos SET state='delivery_unknown',error='Painel reiniciou durante o envio; confira o Telegram.' WHERE state='sending'")
 
     @contextmanager
     def db(self):
@@ -220,7 +238,12 @@ class Store:
                 product.update(selected=bool(entry["selected"]), decision=entry["decision"])
                 result["products"].append(product)
             result["products"].sort(key=lambda p: (not p["selected"], -p["score"]))
-            return result
+        videos = video_module.Videos.latest_static(self, run_id)
+        delivered = self.deliveries(run_id)
+        for product in result["products"]:
+            product["video"] = videos.get(product["key"])
+            product["delivery"] = (delivered.get(product["key"]) or {}).get("state")
+        return result
 
     def decision(self, key, state):
         if state not in DECISIONS:
@@ -590,6 +613,7 @@ class Engine:
         self.lock = threading.Lock()
         self.heartbeat = time.time()
         self.stop = threading.Event()
+        self.videos = video_module.Videos(self, TZ)
 
     def collect(self, source="manual"):
         if not self.lock.acquire(blocking=False):
@@ -658,14 +682,14 @@ class Engine:
         return [p for p in run["products"] if p["selected"] and p["key"] not in excluded
                 and p["decision"] not in ("discarded", "published")]
 
-    def telegram_call(self, token, method, payload, photo=None):
+    def telegram_call(self, token, method, payload, upload=None):
+        """`upload` = (field, filename, content type, bytes) sends multipart instead of JSON."""
         url = f"https://api.telegram.org/bot{token}/{method}"
         for attempt in range(2):
             try:
-                if photo:
-                    # Upload the original file: Telegram cannot always fetch Shopee CDN URLs by itself.
+                if upload:
                     fields = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in payload.items()}
-                    body, kind = multipart(fields, "photo", "produto" + photo[2], photo[0], photo[1])
+                    body, kind = multipart(fields, *upload)
                     result = self.sender(url, body, {"Content-Type": kind})
                 else:
                     result = self.sender(url, json.dumps(payload).encode())
@@ -692,7 +716,9 @@ class Engine:
             # Fall back to letting Telegram fetch the URL.
             return self.telegram_call(token, "sendPhoto", {**base, "photo": product["image"], "caption": caption})
         extension = {"image/png": ".png", "image/webp": ".webp"}.get(kind, ".jpg")
-        return self.telegram_call(token, "sendPhoto", {**base, "caption": caption}, photo=(kind, data, extension))
+        # Upload the original file: Telegram cannot always fetch Shopee CDN URLs by itself.
+        return self.telegram_call(token, "sendPhoto", {**base, "caption": caption},
+                                  upload=("photo", "produto" + extension, kind, data))
 
     def send(self, run_id):
         if not self.lock.acquire(blocking=False):
@@ -783,6 +809,15 @@ class Engine:
                     for p in run["products"]:
                         if p["selected"] and p["key"] not in keep:
                             db.execute("UPDATE offers SET selected=0 WHERE run_id=? AND product_key=?", (run_id, p["key"]))
+            if state != "not_sent":
+                confirmed = self.store.deliveries(run_id)
+                for product in products:
+                    entry = confirmed.get(product["key"]) or {}
+                    if entry.get("state") == "sent" and entry.get("photo_message_id"):
+                        try:
+                            self.videos.enqueue(run_id, product, entry["photo_message_id"])
+                        except Exception as error:  # A video problem never undoes a confirmed delivery.
+                            self.store.log("error", f"Vídeo de {product['name'][:40]} não entrou na fila: {safe_error(error)}")
             if state == "not_sent":
                 self.store.log("error", f"Envio #{run_id} recusado pelo Telegram: {summary}")
                 raise ValueError("Telegram recusou o envio: " + summary)
@@ -798,6 +833,10 @@ class Engine:
     def tick(self, now=None):
         now = now or datetime.now(TZ)
         self.heartbeat = time.time()
+        try:
+            self.videos.reconcile()
+        except Exception as error:
+            self.store.log("error", "Vídeos: " + safe_error(error))
         settings = self.store.settings()
         if not settings["schedule_enabled"] or now.strftime("%H:%M") < settings["schedule_time"]:
             return

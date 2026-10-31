@@ -54,6 +54,12 @@ def create_app(data_dir=None, testing=False):
             supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
             if not store.check_worker_token(supplied):
                 return jsonify(error="Token do worker inválido."), 401
+            if request.path.endswith("/video"):
+                # Only the authenticated video upload may exceed the global 64 KB body limit.
+                request.max_content_length = 52 * 1024 * 1024
+                if request.mimetype != "application/octet-stream":
+                    return jsonify(error="Envie o vídeo como application/octet-stream."), 415
+                return None
             if request.method != "GET" and not request.is_json:
                 return jsonify(error="Requisição JSON obrigatória."), 415
             return None
@@ -154,7 +160,7 @@ def create_app(data_dir=None, testing=False):
                        telegram=credentials, schedule=dict(slot) if slot else None,
                        shopee_configured=bool(store.shopee()["app_id"] and store.shopee()["secret"]),
                        shopee_app_id=store.shopee()["app_id"],
-                       llm=public_llm(store.llm()), worker=store.worker_status(),
+                       llm=public_llm(store.llm()), worker=store.worker_status(), video=engine.videos.summary(),
                        version=os.environ.get("APP_VERSION", "local"))
 
     @app.get("/api/runs/<int:run_id>")
@@ -257,7 +263,7 @@ def create_app(data_dir=None, testing=False):
         body = request.get_json()
         worker_id = worker_identity(body)
         kinds = body.get("kinds")
-        if not isinstance(kinds, list) or not kinds or not all(k in ("llm",) for k in kinds):
+        if not isinstance(kinds, list) or not kinds or not all(k in ("llm", "video") for k in kinds):
             raise ValueError("kinds inválido.")
         version = str(body.get("version", ""))[:40]
         store.worker_seen(worker_id, version, kinds)
@@ -276,10 +282,43 @@ def create_app(data_dir=None, testing=False):
         store.worker_touch(worker_id)
         if type(body.get("ok")) is not bool:
             raise ValueError("ok deve ser verdadeiro ou falso.")
-        output = body.get("output")
-        store.finish_task(task_id, worker_id, body["ok"], dict(output=output) if body["ok"] else None,
-                          str(body.get("error", ""))[:500])
+        output, code = body.get("output"), str(body.get("code", ""))[:40]
+        store.finish_task(task_id, worker_id, body["ok"], dict(output=output, code=code), str(body.get("error", ""))[:500])
+        if store.task(task_id)["kind"] == "video":
+            engine.videos.finish(task_id, body["ok"], output, code, body.get("error", ""), body.get("charged") is True)
         return jsonify(ok=True)
+
+    @app.post("/api/worker/tasks/<int:task_id>/progress")
+    def worker_progress(task_id):
+        body = request.get_json()
+        worker_id = worker_identity(body)
+        store.worker_touch(worker_id)
+        engine.videos.progress(task_id, worker_id, body.get("stage"), body.get("credits"))
+        return jsonify(ok=True)
+
+    @app.post("/api/worker/tasks/<int:task_id>/video")
+    def worker_video(task_id):
+        worker_id = worker_identity({"worker_id": request.headers.get("X-Worker-Id")})
+        store.worker_touch(worker_id)
+        engine.videos.upload(task_id, worker_id, request.get_data(cache=False))
+        return jsonify(ok=True)
+
+    @app.post("/api/videos")
+    def video_create():
+        body = request.get_json() or {}
+        if not isinstance(body.get("run_id"), int) or not isinstance(body.get("key"), str):
+            raise ValueError("Informe a consulta e o produto.")
+        return jsonify(video_id=engine.videos.enqueue_manual(body["run_id"], body["key"]))
+
+    @app.post("/api/videos/<int:video_id>/resend")
+    def video_resend(video_id):
+        engine.videos.deliver(video_id, manual=True)
+        return jsonify(engine.videos.get(video_id))
+
+    @app.post("/api/videos/resume")
+    def video_resume():
+        engine.videos.resume()
+        return jsonify(engine.videos.summary())
 
     if not testing:
         engine.start()

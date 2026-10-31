@@ -1,10 +1,10 @@
 [Unit]
-Description=Shopee Studio worker (Antigravity CLI tasks for the panel)
+Description=Shopee Studio worker (Antigravity CLI and Google Flow tasks for the panel)
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/.local/share/shopee-studio-worker/studio_worker.py
+ExecStart=%h/.local/share/shopee-studio-worker/venv/bin/python %h/.local/share/shopee-studio-worker/studio_worker.py
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=20
