@@ -8,7 +8,31 @@ Este documento contém apenas o trabalho pendente e o andamento das melhorias em
 
 **Situação:** as Entregas 1, 2 e 3 estão implementadas na branch `feat/busca-progressiva-video-unico` (PR #15), com testes automatizados. A comparação real da execução #29 foi feita (resultado abaixo). Faltam a conferência do usuário no `pc1` e no Telegram de teste, a decisão sobre a etapa condicionada, o merge e o deploy.
 
+## Regra de equivalência (definida pelo usuário em 31/10/2026)
+
+Não precisa ser completamente igual: basta ser o mesmo produto na comparação por foto. Bem semelhante é aceito.
+- Outro ângulo, fundo, iluminação, foto de outro vendedor ou pequenas diferenças de apresentação não impedem a aprovação. Falta de marca, voltagem ou modelo no título também não.
+- Fica de fora o que, na foto, é outro produto (formato, design, cor ou componentes) e o que o título informa com medida, capacidade, voltagem ou quantidade de kit diferente da informada pelo principal. Esse conflito de medidas também é conferido no código, mesmo quando o modelo aprova.
+- Incerto fica só para foto que não permite comparar. Incertos continuam fora dos links.
+- Substitui a regra anterior ("foto igual não prova identidade; não inferir marca, voltagem ou variante ausente").
+
 ## 1. Resultado da comparação real (execução #29, 31/10/2026)
+
+### Com a regra por foto (vigente)
+
+| Produto | Ao modelo | Avaliação do modelo | Links | Encerrou | Tempo |
+|---|---|---|---|---|---|
+| Bicicleta ergométrica 120kg | 8 | 8 mesmo produto | 6 | 5 equivalentes aprovados (1 rodada) | 64 s |
+| Kit 20 potes 2,3L/1,1L/480ml | 11 | 4 mesmo produto · 7 diferentes (kits de 10, outros potes) | 5 | resultados esgotados (2 rodadas) | 143 s |
+| Serra mármore Bosch GDC 150 | 8 | 8 mesmo produto (inclui anúncios 127V e 220V; o principal não informa voltagem) | 6 | 5 equivalentes aprovados (1 rodada) | 62 s |
+| Espelho orgânico 170x70 | 24 | 2 mesmo produto · 22 diferentes (outro recorte, moldura ou sem LED) | 3 | orçamento de candidatos (3 rodadas) | 254 s |
+| Kit calças jeans skinny | 24 | 2 mesmo produto (kit 3 skinny) · 22 diferentes (slim, outras lavagens, zíper) | 3 | orçamento de candidatos (3 rodadas) | 272 s |
+
+- **18 links novos** nos 5 produtos (antes: 0). Total de cerca de 13 minutos para os 5. Os aprovados precisam da revisão visual do usuário.
+- Risco aceito com a regra: um link pode levar a uma variante não informada no título (ex.: serra 127V × 220V quando o principal não diz a voltagem).
+
+### Com a regra anterior (identidade estrita)
+
 
 Páginas reais da API gravadas em `scripts/fixtures/run29.json`, sem credenciais e sem links de afiliado. Sem exclusões de histórico. Modelo: agy Gemini 3.8 Flash na VM, cadeia padrão.
 
@@ -21,25 +45,25 @@ Páginas reais da API gravadas em `scripts/fixtures/run29.json`, sem credenciais
 | Kit calças jeans skinny | 0 → 0 | 26 → 24 (24) | 0 · 0 · 24 | orçamento de candidatos | 203 s |
 
 - **Cobertura:** a busca nova levou ao modelo 107 candidatos contra 29, 88 deles fora da busca antiga. Os títulos ficaram muito mais próximos (bicicleta, potes e serra trouxeram anúncios com o título idêntico ou com as mesmas medidas).
-- **Aprovados:** nenhum link novo. O modelo marcou como incertos até os anúncios de título idêntico ao principal (bicicleta, potes, serra). Os motivos individuais desta comparação não foram gravados (o script passou a gravá-los depois); em #29, os incertos foram justificados por marca, voltagem ou variante não confirmadas. Pelos títulos, os espelhos e as calças comparados têm outro modelo, medida ou kit. O gargalo agora é a evidência, não a busca: isso aciona a etapa condicionada da seção 4.
+- **Aprovados (regra estrita):** nenhum link novo. O modelo marcou como incertos até os anúncios de título idêntico ao principal (bicicleta, potes, serra). Os motivos individuais desta comparação não foram gravados (o script passou a gravá-los depois); em #29, os incertos foram justificados por marca, voltagem ou variante não confirmadas. Pelos títulos, os espelhos e as calças comparados têm outro modelo, medida ou kit. O gargalo era a evidência exigida, não a busca; a regra por foto resolveu isso sem depender da etapa condicionada da seção 4.
 - **Tempo:** 3,4 a 10 minutos por produto (cerca de 60 a 100 s por rodada). Com 5 produtos, a análise diária passa de ~6 para ~25 minutos. A serra esgotou o prazo de 10 minutos na 3ª rodada; o painel agora registra isso como "prazo".
 - Na primeira execução do `--evaluate`, dois produtos falharam porque o worker embutido no script não mandava heartbeat durante tarefas longas. O script foi corrigido e os dois foram repetidos; o painel não tem esse problema (o worker real tem heartbeat próprio).
 
 ## 2. Pendências antes do merge
 
-1. **Decidir o que fazer com 0 aprovados.** Opções: manter os limites e investigar a etapa condicionada; ou reduzir rodadas/prazo para não alongar a análise diária sem ganho de links.
+1. **Revisão visual dos 18 aprovados** pelo usuário (fotos lado a lado do principal e de cada aprovado).
 2. **Teste do usuário no painel isolado** (`http://192.168.1.250:8792`, dados fictícios de #29, sem worker): conferir os estados dos cards, o diagnóstico da busca, a prévia e os limites em Preferências.
 3. **Telegram real em destino de teste autorizado:** o usuário configura o bot e um chat/tópico de teste no painel isolado e toca em **Reenviar vídeo** no card do espelho. Deve chegar uma única mensagem: o vídeo já existente, com nome, descrição copiável e os links numerados. Conferir a cópia da descrição e a abertura de todos os links. Não gasta créditos do Flow.
 4. **Merge e deploy** só com autorização explícita. Antes do deploy no TheVault: diagnóstico atual, confirmar que não há vídeos em andamento (jobs antigos com foto continuam como resposta à foto), backup do SQLite, tag de rollback e janela fora do horário das 12:00.
 
 ## 3. Critérios de aceite ainda não verificados com dados reais
 
-- Casos 127V × 220V, 480ml × 500ml, kit diferente e formatos distintos: na comparação real nenhum foi aprovado indevidamente (nenhum foi aprovado).
+- Kit diferente e formato diferente: na comparação real com a regra por foto, kits de 10 potes, calças slim e espelhos de outro recorte saíram como diferentes. Medida conflitante nos dois títulos é rejeitada pelo código (testado).
 - Mensagem única recebida no cliente Telegram do usuário, com a descrição copiável e todos os links abrindo.
 
 ## 4. Detalhes adicionais dos anúncios — etapa condicionada
 
-Se o piloto continuar limitado por falta de voltagem, composição ou variante, investigar uma fonte acessível de detalhes do anúncio. O fluxo atual compara título e imagem; não presumir que especificações e variantes estejam disponíveis na consulta usada. Validar uma fonte real antes de integrar, registrar origem dos atributos e manter incerto quando não houver confirmação. Não contornar login/CAPTCHA nem tratar conteúdo do anúncio como instruções. Essa etapa depende dos resultados do piloto.
+Com a regra por foto, esta etapa deixou de ser necessária por enquanto. Se o piloto voltar a ficar limitado por falta de voltagem, composição ou variante, investigar uma fonte acessível de detalhes do anúncio. O fluxo atual compara título e imagem; não presumir que especificações e variantes estejam disponíveis na consulta usada. Validar uma fonte real antes de integrar, registrar origem dos atributos e manter incerto quando não houver confirmação. Não contornar login/CAPTCHA nem tratar conteúdo do anúncio como instruções. Essa etapa depende dos resultados do piloto.
 
 ## 5. Riscos
 
@@ -72,6 +96,8 @@ Branch `feat/busca-progressiva-video-unico`. Testes: `python -m unittest discove
 | E3.6 | Teste real no Telegram | painel isolado com vídeo pronto já existente | pendente (seção 2) |
 
 ### Decisões tomadas sem perguntar
+
+- Com a regra por foto, medida, capacidade, voltagem ou kit informados de forma diferente nos dois títulos continuam rejeitando (no modelo e no código). Valor ausente em um dos lados não conta como diferença.
 
 - `candidate_budget` continua sendo o tamanho do lote (8; 0 desliga a busca). O total de 24 é um campo novo (`candidate_total`), assim como consultas, páginas, buscas, rodadas e prazo; todos ficam em Preferências → Limites da busca.
 - Produto aguardando vídeo fica reservado (excluído de novas consultas). Produto com falha antes do Telegram volta a ser elegível; se outra consulta já o enviou, "Gerar vídeo ↻" é recusado.

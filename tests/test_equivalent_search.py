@@ -298,6 +298,42 @@ class RoundsTest(unittest.TestCase):
         self.assertEqual(validate_llm({}, dict(old, candidate_budget=5))["candidate_total"], 24)
 
 
+class PhotoRuleTest(unittest.TestCase):
+    """User rule (31/10): the same product by photo is enough; very similar is accepted. Missing brand,
+    voltage or model never blocks; a measure stated differently in both titles still rejects."""
+
+    def candidate(self, name):
+        return dict(key="9:9", name=name, shop="Loja", price=500.0, link="https://s.shopee.com.br/9",
+                    image="https://down-br.img.susercontent.com/file/9")
+
+    def test_prompt_accepts_the_same_product_by_photo(self):
+        for prompt in (analysis.build_prompt(MAIN, []), analysis.build_equivalence_prompt(MAIN, [])):
+            self.assertIn("mesmo produto na foto", prompt)
+            self.assertIn("não precisa ser idêntica", prompt)
+            self.assertIn("Falta de marca, voltagem ou modelo no título não impede", prompt)
+            self.assertNotIn("Foto igual NÃO prova", prompt)
+
+    def test_conflicting_measure_in_both_titles_overrides_a_photo_match(self):
+        main = dict(MAIN, name="Espelho Orgânico Corpo Inteiro 170x70cm Led")
+        output = dict(equivalents=[dict(id="C1", verdict="match", reason="mesma foto"),
+                                   dict(id="C2", verdict="match", reason="mesma foto"),
+                                   dict(id="C3", verdict="match", reason="mesma foto")])
+        reviewed = analysis.review(main, [self.candidate("Espelho Orgânico 120X50cm Led"),
+                                          self.candidate("Espelho Orgânico 170x70 e 150x50 Led"),
+                                          self.candidate("Espelho Orgânico Corpo Inteiro Led")], output)
+        self.assertEqual([c["verdict"] for c in reviewed], ["incompatible", "match", "match"])
+        self.assertIn("120x50", reviewed[0]["reason"])
+
+    def test_voltage_missing_on_the_main_listing_does_not_block(self):
+        output = dict(equivalents=[dict(id="C1", verdict="match", reason="mesma serra na foto")])
+        main = dict(MAIN, name="Serra Mármore Bosch GDC 150 125mm 1500W Profissional")
+        reviewed = analysis.review(main, [self.candidate("Serra Mármore Bosch GDC 150 1500W 125mm 220V")], output)
+        self.assertEqual(reviewed[0]["verdict"], "match")
+        main220 = dict(main, name=main["name"] + " 127V")
+        reviewed = analysis.review(main220, [self.candidate("Serra Mármore Bosch GDC 150 1500W 125mm 220V")], output)
+        self.assertEqual(reviewed[0]["verdict"], "incompatible")
+
+
 class CompareScriptTest(unittest.TestCase):
     def test_recorded_comparison_reaches_listings_the_old_search_missed(self):
         import importlib.util
