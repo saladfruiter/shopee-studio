@@ -2,6 +2,9 @@
 !requirements.txt
 !app.py
 !core.py
+!content.py
+!analysis.py
+!llm.py
 !static/
 !static/**
 !templates/

@@ -1,9 +1,11 @@
 """Persistent offer collection, ranking, delivery and scheduling."""
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -14,6 +16,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import analysis
+from content import plain, product_messages
+from llm import LLM_DEFAULTS, ModelError, Runner, WORKER_ONLINE_SECONDS, fetch_image, public_llm, validate_llm
 
 TZ = ZoneInfo("America/Sao_Paulo")
 DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
@@ -128,7 +134,21 @@ class Store:
                     status TEXT, run_id INTEGER);
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY, created TEXT, level TEXT, message TEXT);
+                CREATE TABLE IF NOT EXISTS llm (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS worker_auth (id INTEGER PRIMARY KEY CHECK(id=1), token_hash TEXT, created TEXT);
+                CREATE TABLE IF NOT EXISTS workers (
+                    id TEXT PRIMARY KEY, last_seen REAL, version TEXT, kinds TEXT);
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, status TEXT, created TEXT,
+                    deadline REAL, worker_id TEXT, claimed_at TEXT, finished TEXT, result TEXT, error TEXT);
+                CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status,kind,id);
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    run_id INTEGER, product_key TEXT, state TEXT, photo_message_id INTEGER,
+                    text_message_id INTEGER, sent_at TEXT, error TEXT, PRIMARY KEY(run_id, product_key));
             """)
+            if "progress" not in {r[1] for r in db.execute("PRAGMA table_info(runs)")}:
+                db.execute("ALTER TABLE runs ADD COLUMN progress TEXT")
+            db.execute("INSERT OR IGNORE INTO llm VALUES(1,?)", (json.dumps(LLM_DEFAULTS),))
             first = dict(DEFAULTS)
             for env, key in (("SHOPEE_KEYWORD", "keyword"),
                              ("SHOPEE_MIN_RATING", "min_rating"), ("SHOPEE_PAGE_LIMIT", "page_limit"),
@@ -145,8 +165,11 @@ class Store:
                 db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(migrated_settings),))
             # A process crash during delivery is ambiguous; never automatically resend it.
             db.execute("UPDATE runs SET delivery='unknown' WHERE delivery='sending'")
-            db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status='running'", (utcnow(),))
+            db.execute("UPDATE runs SET status='failed', error='Execução interrompida; consulte os logs.', finished=? WHERE status IN ('running','analyzing')", (utcnow(),))
             db.execute("UPDATE schedule SET status='retry', next_retry=0 WHERE status='running'")
+            db.execute("UPDATE deliveries SET state='unknown' WHERE state='sending'")
+            # Nobody waits for tasks created before a restart.
+            db.execute("UPDATE tasks SET status='expired' WHERE status IN ('queued','claimed')")
 
     @contextmanager
     def db(self):
@@ -261,12 +284,15 @@ class Store:
         self.log("info", "Destino Telegram atualizado. Token preservado em armazenamento local.")
 
     def exclusions(self):
-        """Exclude every offer already sent, or possibly sent, to Telegram."""
+        """Exclude every offer already sent, or possibly sent, to Telegram, plus its validated equivalents."""
         with self.db() as db:
             excluded = {r[0] for r in db.execute("SELECT product_key FROM decisions WHERE state IN ('discarded','published')")}
-            excluded.update(r[0] for r in db.execute("""
-                SELECT DISTINCT o.product_key FROM offers o JOIN runs r ON r.id=o.run_id
-                WHERE o.selected=1 AND r.delivery IN ('sent','unknown','sending')"""))
+            for row in db.execute("""
+                SELECT o.product_key,o.body FROM offers o JOIN runs r ON r.id=o.run_id
+                WHERE o.selected=1 AND r.delivery IN ('sent','unknown','sending')"""):
+                excluded.add(row[0])
+                links = (json.loads(row[1]).get("analysis") or {}).get("links") or []
+                excluded.update(entry["key"] for entry in links if entry.get("key"))
             return excluded
 
     def history(self, key):
@@ -275,13 +301,116 @@ class Store:
                 SELECT r.started,o.body FROM offers o JOIN runs r ON r.id=o.run_id
                 WHERE o.product_key=? ORDER BY r.id DESC LIMIT 60""", (key,))]
 
+    def llm(self):
+        with self.db() as db:
+            return validate_llm({}, json.loads(db.execute("SELECT body FROM llm WHERE id=1").fetchone()[0]))
+
+    def save_llm(self, payload):
+        value = validate_llm(payload, self.llm())
+        with self.db() as db:
+            db.execute("UPDATE llm SET body=? WHERE id=1", (json.dumps(value),))
+        self.log("info", "Modelos de visão/texto atualizados. Chaves preservadas no servidor.")
+        return public_llm(value)
+
+    def set_worker_token(self):
+        token = secrets.token_urlsafe(32)
+        with self.db() as db:
+            db.execute("INSERT INTO worker_auth VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash,created=excluded.created",
+                       (hashlib.sha256(token.encode()).hexdigest(), utcnow()))
+        self.log("info", "Novo token do worker gerado; o anterior deixou de valer.")
+        return token
+
+    def check_worker_token(self, token):
+        with self.db() as db:
+            row = db.execute("SELECT token_hash FROM worker_auth WHERE id=1").fetchone()
+        return bool(row and row[0] and token) and hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), row[0])
+
+    def worker_seen(self, worker_id, version, kinds):
+        with self.db() as db:
+            db.execute("INSERT INTO workers VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,version=excluded.version,kinds=excluded.kinds",
+                       (worker_id, time.time(), version, json.dumps(kinds)))
+
+    def worker_touch(self, worker_id):
+        with self.db() as db:
+            db.execute("UPDATE workers SET last_seen=? WHERE id=?", (time.time(), worker_id))
+
+    def worker_online(self, kind="llm"):
+        with self.db() as db:
+            rows = db.execute("SELECT kinds FROM workers WHERE last_seen>?", (time.time() - WORKER_ONLINE_SECONDS,)).fetchall()
+        return any(kind in json.loads(r[0] or "[]") for r in rows)
+
+    def worker_status(self):
+        with self.db() as db:
+            token = db.execute("SELECT created FROM worker_auth WHERE id=1").fetchone()
+            rows = [dict(r) for r in db.execute("SELECT * FROM workers ORDER BY last_seen DESC LIMIT 5")]
+            queued = db.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('queued','claimed')").fetchone()[0]
+        for row in rows:
+            row["online"] = time.time() - row["last_seen"] < WORKER_ONLINE_SECONDS
+            row["last_seen"] = datetime.fromtimestamp(row["last_seen"], timezone.utc).isoformat()
+            row["kinds"] = json.loads(row["kinds"] or "[]")
+        return dict(token_created=token[0] if token else None, workers=rows, pending_tasks=queued)
+
+    def create_task(self, kind, payload, deadline):
+        with self.db() as db:
+            return db.execute("INSERT INTO tasks(kind,payload,status,created,deadline) VALUES(?,?,'queued',?,?)",
+                              (kind, json.dumps(payload), utcnow(), time.time() + deadline)).lastrowid
+
+    def task(self, task_id):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise ValueError("Tarefa não encontrada.")
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        result["result"] = json.loads(result["result"]) if result["result"] else None
+        return result
+
+    def expire_task(self, task_id):
+        with self.db() as db:
+            db.execute("UPDATE tasks SET status='expired' WHERE id=? AND status IN ('queued','claimed')", (task_id,))
+
+    def claim_task(self, worker_id, kinds):
+        with self.db() as db:
+            db.execute("UPDATE tasks SET status='expired' WHERE status IN ('queued','claimed') AND deadline<?", (time.time(),))
+            marks = ",".join("?" for _ in kinds)
+            row = db.execute(f"SELECT id FROM tasks WHERE status='queued' AND kind IN ({marks}) ORDER BY id LIMIT 1",
+                             list(kinds)).fetchone()
+            if not row:
+                return None
+            db.execute("UPDATE tasks SET status='claimed',worker_id=?,claimed_at=? WHERE id=? AND status='queued'",
+                       (worker_id, utcnow(), row[0]))
+        task = self.task(row[0])
+        return dict(id=task["id"], kind=task["kind"], payload=task["payload"],
+                    seconds_left=max(0, int(task["deadline"] - time.time())))
+
+    def finish_task(self, task_id, worker_id, ok, result=None, error=""):
+        with self.db() as db:
+            changed = db.execute("UPDATE tasks SET status=?,finished=?,result=?,error=? WHERE id=? AND worker_id=? AND status='claimed'",
+                                 ("done" if ok else "failed", utcnow(), json.dumps(result or {}), safe_error(error)[:500],
+                                  task_id, worker_id)).rowcount
+        if changed != 1:
+            raise ValueError("Tarefa expirada ou de outro worker; resultado ignorado.")
+
+    def set_progress(self, run_id, status, progress):
+        with self.db() as db:
+            db.execute("UPDATE runs SET status=?,progress=? WHERE id=?", (status, progress, run_id))
+
+    def save_analysis(self, run_id, product):
+        with self.db() as db:
+            db.execute("UPDATE offers SET body=? WHERE run_id=? AND product_key=?",
+                       (json.dumps(product), run_id, product["key"]))
+
+    def deliveries(self, run_id):
+        with self.db() as db:
+            return {r["product_key"]: dict(r) for r in db.execute("SELECT * FROM deliveries WHERE run_id=?", (run_id,))}
+
 
 def shopee_query(settings, page, sort_type=5):
     args = ["listType: 0", f"sortType: {sort_type}", f"page: {page}", f"limit: {settings['page_limit']}"]
     if settings["keyword"]:
         args.append("keyword: " + json.dumps(settings["keyword"], ensure_ascii=False))
     return """query { productOfferV2(%s) {
-      nodes { itemId shopId productName shopName offerLink price priceMin priceMax
+      nodes { itemId shopId productName shopName offerLink productLink imageUrl price priceMin priceMax
         commission commissionRate appExistRate appNewRate ratingStar sales
         periodStartTime periodEndTime }
       pageInfo { page hasNextPage }
@@ -368,6 +497,8 @@ def rank_offers(nodes, settings, excluded=None, now=None):
         link = str(node.get("offerLink") or "")
         if not link.startswith("https://"):
             continue
+        image = str(node.get("imageUrl") or "")
+        image = image if image.startswith("https://") else ""
         if price <= 0 or payout <= 0 or price < settings["min_price"] or (settings["max_price"] and price > settings["max_price"]):
             continue
         if sales < settings["min_sales"] or payout < settings["min_commission"]:
@@ -376,7 +507,7 @@ def rank_offers(nodes, settings, excluded=None, now=None):
                            name=str(node.get("productName") or "Produto"), shop=str(node.get("shopName") or ""),
                            price=price, commission=payout, app_existing_rate=rate, app_new_rate=new_rate,
                            commission_basis="cliente existente" if rate > 0 else "comissão informada pela API",
-                           rating=rating, sales=int(sales),
+                           rating=rating, sales=int(sales), image=image,
                            link=link, expires=end if math.isfinite(end) and end > 0 else None)
     eligible = list(unique.values())
     candidates = [p for p in eligible if p["rating"] >= settings["min_rating"]]
@@ -410,79 +541,52 @@ def rank_offers(nodes, settings, excluded=None, now=None):
     return candidates, set(selected), warning.strip()
 
 
-def social_copy(product):
-    name = re.sub(r"\s+", " ", str(product.get("name") or "Produto")).strip()
-    title = f"Conheça: {name}"
-    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", name)
-    stopwords = {"com", "para", "sem", "por", "uma", "um", "de", "da", "do", "das", "dos", "e", "em", "no", "na", "kit", "novo", "nova"}
-    hashtags = []
-    for word in words:
-        if len(word) < 3 or word.casefold() in stopwords:
-            continue
-        tag = "".join(char for char in unicodedata.normalize("NFKD", word) if not unicodedata.combining(char))
-        tag = re.sub(r"[^A-Za-z0-9_]", "", tag)
-        if tag and f"#{tag}" not in hashtags:
-            hashtags.append(f"#{tag}")
-        if len(hashtags) == 2:
-            break
-    tags = " ".join(["#Shopee", "#Achadinhos", *hashtags])
-    description = shorten_copy(f"Confira {name} na Shopee! {tags}")
-    title = shorten_copy(title)
-    prompt_template = "Google Flow, vídeo 9:16, 8 s: {title}. Português do Brasil. Descrição: {description}. Demonstre em uso, closes dinâmicos, narração persuasiva e CTA ‘Compre na Shopee’. Não invente."
-    fixed_length = len(prompt_template.format(title="", description=""))
-    available = max(0, 256 - fixed_length)
-    title_limit = min(len(title), max(1, available // 2))
-    description_limit = min(len(description), available - title_limit)
-
-    prompt = prompt_template.format(title=shorten_copy(title, title_limit),
-                                    description=shorten_copy(description, description_limit))
-    return dict(title=title, description=description, prompt=prompt)
+class TelegramRejected(Exception):
+    """Telegram answered with a definite refusal: the message was not delivered."""
 
 
-def shorten_copy(value, limit=256):
-    if len(value) <= limit:
-        return value
-    if limit <= 1:
-        return value[:max(0, limit)]
-    shortened = value[:limit - 1].rsplit(" ", 1)[0].strip()
-    return (shortened or value[:limit - 1]).rstrip(" ,;:") + "…"
+def search_equivalents(product, settings, credentials, excluded, budget):
+    """One extra API page per selected product, ordered by relevance to its name."""
+    keyword = analysis.equivalence_keyword(product["name"])
+    if not keyword or budget <= 0:
+        return []
+    if not credentials.get("app_id") or not credentials.get("secret"):
+        raise ValueError("Credenciais da Shopee ausentes.")
+    data = fetch_product_page(dict(settings, keyword=keyword, page_limit=50), 1, credentials, sort_type=1)
+    return analysis.select_candidates(data["nodes"], product, excluded, budget)
 
 
-def telegram_keyboard(products):
-    keyboard = []
-    for index, product in enumerate(products, 1):
-        copy = social_copy(product)
-        keyboard.append([
-            {"text": f"📋 Título {index}", "copy_text": {"text": copy["title"]}},
-            {"text": f"📋 Descrição {index}", "copy_text": {"text": copy["description"]}},
-        ])
-        keyboard.append([
-            {"text": f"🎬 Prompt 8s {index}", "copy_text": {"text": copy["prompt"]}},
-        ])
-    return {"inline_keyboard": keyboard}
+def telegram_preview(products):
+    messages = []
+    for product in products:
+        caption, text, _ = product_messages(product)
+        messages.append(dict(key=product["key"], name=product["name"], caption=plain(caption), text=plain(text),
+                             status=(product.get("analysis") or {}).get("status", "fallback")))
+    header = (f"{len(products)} produto(s) · {datetime.now(TZ):%d/%m/%Y} · comissões estimadas, não garantidas no canal Vídeo.\n"
+              "Cada produto chega em uma mensagem com foto, legenda e links; o prompt vem em resposta a ela.")
+    body = "\n\n".join(f"── MENSAGEM {i} (foto) ──\n{m['caption']}\n\n── RESPOSTA {i} ──\n{m['text']}"
+                         for i, m in enumerate(messages, 1))
+    return dict(text=header + "\n\n" + body, messages=messages)
 
 
-def telegram_text(products):
-    lines = [f"Top {len(products)} Shopee · {datetime.now(TZ):%d/%m/%Y}",
-             "Comissões estimadas, não garantidas no canal Vídeo.",
-             "Toque nos botões para copiar título, descrição ou prompt.", ""]
-    for index, p in enumerate(products, 1):
-        copy = social_copy(p)
-        lines.extend([f"{index}. {p['name'][:100]}", f"R$ {p['price']:.2f} · comissão estimada R$ {p['commission']:.2f}",
-                      f"Nota {p['rating']:.1f} · {p['sales']} vendas · score {p['score']:.1f}", p["link"],
-                      f"🎬 TÍTULO DO VÍDEO · {copy['title']}",
-                      f"📝 DESCRIÇÃO · {copy['description']}",
-                      f"🎥 PROMPT GOOGLE FLOW (8 s) · {copy['prompt']}", ""])
-    text = "\n".join(lines)
-    if len(text.encode("utf-16-le")) // 2 > 4096:
-        raise ValueError("Prévia excede o limite do Telegram; reduza a quantidade de produtos.")
-    return text
+def multipart(fields, name, filename, kind, data):
+    boundary = "----studio" + secrets.token_hex(12)
+    parts = []
+    for key, value in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                 f'Content-Type: {kind}\r\n\r\n'.encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 class Engine:
-    def __init__(self, store, fetcher=None, sender=request_json):
-        self.store, self.sender = store, sender
+    def __init__(self, store, fetcher=None, sender=request_json, searcher=None, runner=None, image_fetcher=fetch_image):
+        self.store, self.sender, self.image_fetcher = store, sender, image_fetcher
         self.fetcher = fetcher or (lambda settings: fetch_offers(settings, store.shopee()))
+        self.searcher = searcher or (lambda product, settings, excluded, budget:
+                                     search_equivalents(product, settings, store.shopee(), excluded, budget))
+        self.runner = runner or Runner(store)
         self.lock = threading.Lock()
         self.heartbeat = time.time()
         self.stop = threading.Event()
@@ -503,22 +607,92 @@ class Engine:
                 with self.store.db() as db:
                     for product in candidates:
                         db.execute("INSERT INTO offers VALUES(?,?,?,?)", (run_id, product["key"], json.dumps(product), int(product["key"] in selected)))
-                    db.execute("UPDATE runs SET settings=?,status='ready',finished=?,scanned=?,warning=? WHERE id=?",
-                               (json.dumps(settings), utcnow(), len(nodes), warning, run_id))
-                self.store.log("info", f"Consulta #{run_id}: {len(nodes)} ofertas consultadas, {len(selected)} selecionadas.")
+                    db.execute("UPDATE runs SET settings=?,scanned=?,warning=? WHERE id=?",
+                               (json.dumps(settings), len(nodes), warning, run_id))
+                chosen = [p for p in candidates if p["key"] in selected]
+                # Equivalents never repeat a sent offer, another selected product or another product's link.
+                used = set(excluded) | selected
+                for index, product in enumerate(chosen, 1):
+                    self.store.set_progress(run_id, "analyzing", f"Produto {index}/{len(chosen)}: equivalentes e conteúdo")
+                    self.heartbeat = time.time()
+                    product["analysis"] = self.analyze(product, settings, used)
+                    used.update(link["key"] for link in product["analysis"]["links"])
+                    self.store.save_analysis(run_id, product)
+                with self.store.db() as db:
+                    db.execute("UPDATE runs SET status='ready',finished=?,progress=NULL WHERE id=?", (utcnow(), run_id))
+                fallbacks = sum(p["analysis"]["status"] != "ok" for p in chosen)
+                self.store.log("info" if not fallbacks else "error",
+                               f"Consulta #{run_id}: {len(nodes)} ofertas consultadas, {len(selected)} selecionadas"
+                               + (f", {fallbacks} sem validação do modelo." if fallbacks else "."))
             except Exception as error:
                 with self.store.db() as db:
-                    db.execute("UPDATE runs SET status='failed',finished=?,error=? WHERE id=?", (utcnow(), safe_error(error), run_id))
+                    db.execute("UPDATE runs SET status='failed',finished=?,error=?,progress=NULL WHERE id=?", (utcnow(), safe_error(error), run_id))
                 self.store.log("error", f"Consulta #{run_id}: {safe_error(error)}")
                 raise
             return run_id
         finally:
             self.lock.release()
 
+    def analyze(self, product, settings, excluded):
+        notes = []
+        budget = self.store.llm()["candidate_budget"]
+        try:
+            candidates = self.searcher(product, settings, excluded, budget) if budget else []
+        except Exception as error:
+            candidates = []
+            notes.append("Busca de anúncios equivalentes falhou: " + safe_error(error)[:200])
+        try:
+            output, provider, attempts = self.runner.run(
+                analysis.build_prompt(product, candidates), analysis.SCHEMA, analysis.images_for(product, candidates),
+                analysis.make_check(candidates), log=lambda message: self.store.log("info", "Modelo: " + message))
+            result = analysis.finalize(product, candidates, output, provider, attempts, notes)
+            self.store.log("info", f"{product['name'][:60]}: {len(result['links'])} link(s), legenda com "
+                                   f"{result['caption_length']} caracteres ({provider}).")
+            return result
+        except ModelError as error:
+            self.store.log("error", f"{product['name'][:60]}: {safe_error(error)}")
+            return analysis.fallback(product, candidates, safe_error(error)[:400], [], notes)
+
     def sendable_products(self, run):
         excluded = self.store.exclusions()
         return [p for p in run["products"] if p["selected"] and p["key"] not in excluded
                 and p["decision"] not in ("discarded", "published")]
+
+    def telegram_call(self, token, method, payload, photo=None):
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        for attempt in range(2):
+            try:
+                if photo:
+                    # Upload the original file: Telegram cannot always fetch Shopee CDN URLs by itself.
+                    fields = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in payload.items()}
+                    body, kind = multipart(fields, "photo", "produto" + photo[2], photo[0], photo[1])
+                    result = self.sender(url, body, {"Content-Type": kind})
+                else:
+                    result = self.sender(url, json.dumps(payload).encode())
+            except urllib.error.HTTPError as error:
+                try:
+                    detail = json.loads(error.read() or b"{}")
+                except (ValueError, OSError):
+                    detail = {}
+                if error.code == 429 and attempt == 0:
+                    time.sleep(min(30, int((detail.get("parameters") or {}).get("retry_after", 5))))
+                    continue
+                if 400 <= error.code < 500:
+                    raise TelegramRejected(f"HTTP {error.code}: {str(detail.get('description', ''))[:200]}") from None
+                raise
+            if not result.get("ok"):
+                raise TelegramRejected(str(result.get("description") or "Telegram recusou o envio.")[:200])
+            return result["result"]["message_id"]
+        raise TelegramRejected("limite de envio do Telegram")
+
+    def send_photo(self, token, base, product, caption):
+        try:
+            kind, data = self.image_fetcher(product["image"])
+        except Exception:
+            # Fall back to letting Telegram fetch the URL.
+            return self.telegram_call(token, "sendPhoto", {**base, "photo": product["image"], "caption": caption})
+        extension = {"image/png": ".png", "image/webp": ".webp"}.get(kind, ".jpg")
+        return self.telegram_call(token, "sendPhoto", {**base, "caption": caption}, photo=(kind, data, extension))
 
     def send(self, run_id):
         if not self.lock.acquire(blocking=False):
@@ -538,37 +712,86 @@ class Engine:
             token, chat = telegram["token"], telegram["chat_id"]
             if not token or not chat:
                 raise ValueError("Configure o Telegram no .env.")
-            text = telegram_text(products)
-            payload = {"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True},
-                       "reply_markup": telegram_keyboard(products)}
+            messages = {p["key"]: product_messages(p) for p in products}  # Validates limits before sending anything.
+            base = {"chat_id": chat, "parse_mode": "HTML"}
             if telegram["thread_id"]:
-                payload["message_thread_id"] = int(telegram["thread_id"])
-            body = json.dumps(payload).encode()
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
+                base["message_thread_id"] = int(telegram["thread_id"])
             with self.store.db() as db:
                 changed = db.execute("UPDATE runs SET delivery='sending' WHERE id=? AND delivery='not_sent'", (run_id,)).rowcount
                 if changed != 1:
                     raise ValueError("Envio já iniciado.")
-            try:
-                result = self.sender(url, body)
-                if not result.get("ok"):
-                    raise ValueError("Telegram recusou o envio.")
-                message_id = result["result"]["message_id"]
-            except Exception as error:
-                # A timeout may occur AFTER Telegram accepted the message.
+            sent, ambiguous, problems, first_id, uncertain = set(), None, [], None, set()
+
+            def mark(key, state, photo=None, text=None, error=""):
                 with self.store.db() as db:
-                    db.execute("UPDATE runs SET delivery='unknown',error=? WHERE id=?", ("Entrega não confirmada. Confira o Telegram antes de qualquer novo envio.", run_id))
-                self.store.log("error", f"Envio #{run_id} não confirmado: " + safe_error(error).replace(token, "[oculto]"))
-                raise ValueError("Entrega não confirmada; confira o Telegram. Não haverá reenvio automático.") from None
+                    db.execute("INSERT OR REPLACE INTO deliveries VALUES(?,?,?,?,?,?,?)",
+                               (run_id, key, state, photo, text, utcnow() if state == "sent" else None, error[:300]))
+
+            for index, product in enumerate(products):
+                caption, text, _ = messages[product["key"]]
+                mark(product["key"], "sending")
+                try:
+                    if index:
+                        time.sleep(1)  # Stay well below Telegram's per-chat rate limit.
+                    photo_id = None
+                    if product.get("image"):
+                        try:
+                            photo_id = self.send_photo(token, base, product, caption)
+                        except TelegramRejected as error:
+                            problems.append(f"{product['name'][:40]}: foto recusada ({error}); enviado sem foto")
+                    if photo_id is None:
+                        photo_id = self.telegram_call(token, "sendMessage", {**base, "text": caption,
+                                                                              "link_preview_options": {"is_disabled": True}})
+                except TelegramRejected as error:
+                    mark(product["key"], "failed", error=str(error))
+                    problems.append(f"{product['name'][:40]}: {error}")
+                    break  # A definite refusal (chat, token, permission) would repeat for every product.
+                except Exception as error:
+                    mark(product["key"], "unknown", error="Entrega não confirmada.")
+                    uncertain.add(product["key"])
+                    ambiguous = safe_error(error).replace(token, "[oculto]") or type(error).__name__
+                    break
+                first_id = first_id or photo_id
+                sent.add(product["key"])
+                try:
+                    text_id = self.telegram_call(token, "sendMessage", {
+                        **base, "text": text, "link_preview_options": {"is_disabled": True},
+                        "reply_parameters": {"message_id": photo_id, "allow_sending_without_reply": True}})
+                    mark(product["key"], "sent", photo_id, text_id)
+                except TelegramRejected as error:
+                    mark(product["key"], "sent", photo_id, error=f"prompt recusado: {error}")
+                    problems.append(f"{product['name'][:40]}: prompt recusado ({error})")
+                except Exception as error:
+                    mark(product["key"], "sent", photo_id, error="prompt não confirmado")
+                    ambiguous = safe_error(error).replace(token, "[oculto]") or type(error).__name__
+                    break
+            if ambiguous:
+                state = "unknown"
+            else:
+                state = "sent" if sent else "not_sent"
+            summary = "; ".join(problems)
             with self.store.db() as db:
-                db.execute("UPDATE runs SET delivery='sent',sent_at=?,message_id=? WHERE id=?", (utcnow(), message_id, run_id))
-                # Only products in the confirmed message are permanently excluded.
-                delivered = {p["key"] for p in products}
-                for p in run["products"]:
-                    if p["selected"] and p["key"] not in delivered:
-                        db.execute("UPDATE offers SET selected=0 WHERE run_id=? AND product_key=?", (run_id, p["key"]))
-            self.store.log("info", f"Envio #{run_id} confirmado pelo Telegram.")
-            return message_id
+                if state == "not_sent":
+                    # Nothing reached Telegram: fix the configuration and send again.
+                    db.execute("UPDATE runs SET delivery='not_sent',error=? WHERE id=?", (summary or "Envio recusado.", run_id))
+                else:
+                    error = summary if state == "sent" else "Entrega não confirmada. Confira o Telegram antes de qualquer novo envio."
+                    db.execute("UPDATE runs SET delivery=?,sent_at=?,message_id=?,error=? WHERE id=?",
+                               (state, utcnow() if sent else None, first_id, error or None, run_id))
+                    # Only products confirmed (or possibly) delivered stay permanently excluded.
+                    keep = sent | uncertain
+                    for p in run["products"]:
+                        if p["selected"] and p["key"] not in keep:
+                            db.execute("UPDATE offers SET selected=0 WHERE run_id=? AND product_key=?", (run_id, p["key"]))
+            if state == "not_sent":
+                self.store.log("error", f"Envio #{run_id} recusado pelo Telegram: {summary}")
+                raise ValueError("Telegram recusou o envio: " + summary)
+            if state == "unknown":
+                self.store.log("error", f"Envio #{run_id} não confirmado: {ambiguous}")
+                raise ValueError("Entrega não confirmada; confira o Telegram. Não haverá reenvio automático.")
+            self.store.log("info" if not problems else "error",
+                           f"Envio #{run_id}: {len(sent)} produto(s) confirmados pelo Telegram." + (f" Avisos: {summary}" if summary else ""))
+            return first_id
         finally:
             self.lock.release()
 
