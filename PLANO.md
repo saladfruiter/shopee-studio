@@ -1,6 +1,6 @@
 # Plano — Shopee Studio: anúncios equivalentes, conteúdo e vídeo
 
-Atualizado em 2026-10-31. Status: implementação autorizada ("Implemente o plano"), em dois PRs. PR 1 (conteúdo, links equivalentes, LLM com fallbacks, Telegram novo) implementado na branch `feat/conteudo-links-llm`; PR 2 (worker do Flow, legenda e envio do vídeo) pendente. Veja **Andamento** no fim.
+Atualizado em 2026-10-31. Status: PR 1 (conteúdo, links equivalentes, LLM com fallbacks, Telegram novo) mergeado (#13) e em produção. PR 2 (worker do Flow, legenda e envio do vídeo) implementado na branch `feat/flow-video`. Veja **Andamento** no fim.
 
 ## Objetivo e decisões
 
@@ -90,7 +90,7 @@ Ambiente isolado de teste em `/home/hermes/.local/share/flow-vm-test` (modo 700,
 
 ## Andamento
 
-### PR 1 — conteúdo, links equivalentes, LLM, Telegram (branch `feat/conteudo-links-llm`)
+### PR 1 — conteúdo, links equivalentes, LLM, Telegram (#13, em produção)
 
 | # | Pedido | Como ficou | Estado |
 |---|---|---|---|
@@ -101,7 +101,7 @@ Ambiente isolado de teste em `/home/hermes/.local/share/flow-vm-test` (modo 700,
 | 5 | Prompt específico, 10 s | O modelo devolve gancho, demonstração, benefício, chamada e narração (≤ 25 palavras). `content.video_prompt` monta o prompt com regras fixas: preservar o produto, sem texto na tela, sem preço | feito |
 | 6 | LLM configurável + fallbacks + teste | Preferências → Modelo de visão e texto: até 6 modelos (agy ou OpenAI-compatível), ordem, ativo, chave protegida, modelo de texto, timeout, tentativas, orçamento de candidatos. Testar visão manda um PNG vermelho e exige a cor certa | feito, agy validado na VM |
 | 7 | Telegram novo | Mensagem com foto por produto + prompt em resposta. Entrega por produto (`deliveries`): incerto só exclui o produto afetado. Recusa definitiva sem nada enviado volta para "não enviado" | feito, falta teste no Telegram real |
-| 8 | Execução sem PC | Worker na VM (`worker/`) por polling com token, tarefas com prazo, heartbeat. Offline = agy pulado na hora | feito. Serviço systemd só depois do deploy |
+| 8 | Execução sem PC | Worker na VM (`worker/`) por polling com token, tarefas com prazo, heartbeat. Offline = agy pulado na hora | feito, serviço systemd ativo na VM |
 
 Decisões tomadas sem perguntar:
 - Fallback padrão `gemini-4-argon-medium` (agy), para a cadeia já vir com dois modelos sem custo extra.
@@ -110,9 +110,29 @@ Decisões tomadas sem perguntar:
 - O painel baixa a imagem e envia por upload. Se o download falhar, o Telegram busca a URL. Se a foto for recusada, a mensagem sai só em texto.
 - Erro 4xx de endpoint OpenAI-compatível (chave/modelo) pula direto para o próximo modelo, sem novas tentativas.
 
-### PR 2 — Flow + legenda + vídeo (pendente)
+### PR 2 — Flow + legenda + vídeo (branch `feat/flow-video`)
 
-Decisões do usuário: o worker na VM gera o vídeo automaticamente para os produtos enviados, com teto diário de créditos configurável (padrão 75) e pausa se o custo exibido divergir. O vídeo legendado chega como resposta à mensagem do produto (`deliveries.photo_message_id`). A legenda vem de transcrição com faster-whisper local (modelo small, CPU), e o texto do roteiro (`analysis.narration`) só corrige a grafia.
+Decisões do usuário: o worker na VM gera o vídeo automaticamente para os produtos enviados, com teto diário de créditos configurável (padrão 75) e pausa se o custo exibido divergir. O vídeo legendado chega como resposta à mensagem do produto (`deliveries.photo_message_id`). A legenda vem de transcrição com faster-whisper local (modelo small, CPU), e o texto do roteiro (`analysis.narration`) só corrige a grafia. Testes com até 2 gerações (30 créditos) autorizados; foi usada 1.
+
+| # | Pedido | Como ficou | Estado |
+|---|---|---|---|
+| 1 | Vídeo automático após o envio | `video.py`: cada produto confirmado no Telegram vira um job (`videos`) e uma tarefa `video` para o worker, com o custo reservado | feito |
+| 2 | Teto diário de créditos | Soma de `videos.credits` do dia (horário de Brasília). Reserva o custo na fila, libera em falha antes da aprovação e mantém em falha depois dela. Teto atingido = produto sem vídeo, com o motivo | feito |
+| 3 | Pausa se o custo divergir | O worker lê o custo no cartão do agente do Flow (`flow-permission-message`) e só escolhe "Aprovar" se for o esperado para 1 geração. Se não for, escolhe Rejeitar, a fila pausa e chega um alerta no Telegram | feito, testado sem gastar (Rejeitar) |
+| 4 | Não reenviar geração sem reconciliar | A etapa `approving` é registrada no painel antes do clique. Falha ou prazo vencido depois disso = "incerto", sem nova geração automática | feito |
+| 5 | Login/2FA/CAPTCHA | Detectados → pausa + alerta. `worker/flow_login.sh` abre o perfil por noVNC no PC via túnel reverso | feito; o script não foi exercitado com login real |
+| 6 | Legenda da dublagem | `worker/subtitles.py`: faster-whisper small (int8, ~10 s, ~600 MB), alinhamento com o roteiro (difflib), blocos de até 4 palavras sem palavra órfã, ASS branco com contorno a 17% da base, ffmpeg libx264 | feito |
+| 7 | Vídeo como resposta no Telegram | `sendVideo` multipart com `reply_parameters` da foto do produto. Recusa = "envio falhou" com o arquivo guardado e botão Reenviar; incerto não repete | feito; Telegram real só em produção |
+| 8 | Painel | Card com estado do vídeo, "Gerar vídeo ↻" e "Reenviar vídeo". Preferências → Vídeo no Google Flow: liga/desliga, teto, custo, modelo, URL do projeto, uso do dia e Retomar | feito |
+
+Teste real de 31/10, no projeto "out. 30 - 18:40" com Telegram simulado: um produto real (comedouro Jelplast). Foram 109 s do início ao vídeo legendado: confirmação em 42 s, geração e download em ~65 s, legenda em ~10 s. O custo lido e aprovado foi de 15 créditos. O resultado foi 720x1280, 10 s, com 7 blocos de legenda. A narração gerada pelo Flow repetiu palavras ("e ração e ração", "no ponto, no ponto"). A legenda reproduz o que foi falado, e a transcrição confirmou as repetições com alta confiança.
+
+Decisões tomadas sem perguntar:
+- Projeto do Flow configurável (`flow_project_url`); em produção, o de teste "out. 30 - 18:40". Uma sessão nova do agente por vídeo.
+- O worker ajusta sozinho "Confirmar antes de gerar = Sempre", 9:16 e x1. Se o modelo padrão de vídeo for outro, a fila pausa em vez de trocar o modelo.
+- Perfil do Flow com o caminho atual (`~/.local/share/flow-vm-test/profile`), sem mover.
+- Legenda a 17% da base, para sair da área do card de produto da Shopee. Ela ainda pode cobrir a base do produto em planos abertos.
+- "browser_busy" (perfil em uso, ex.: login em andamento) gera até 3 tentativas. Os demais erros não repetem sozinhos.
 
 ## Estado do repositório
 

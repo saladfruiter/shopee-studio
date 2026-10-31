@@ -23,7 +23,24 @@ Painel pessoal para pesquisar, selecionar e acompanhar ofertas de afiliados Shop
 
 ## Worker da VM
 
-O Antigravity CLI só existe logado na VM hermes, então o painel não o chama direto. Um worker na VM busca as tarefas pelo endpoint /api/worker/*, autenticado por um token gerado em Preferências → Worker da VM, e devolve o resultado. Instalação e operação: worker/README.md. Sem o worker, os modelos agy são pulados na hora e a cadeia segue para os fallbacks.
+O Antigravity CLI e o navegador logado no Google Flow só existem na VM hermes, então o painel não os chama direto. Um worker na VM busca as tarefas pelo endpoint /api/worker/*, autenticado por um token gerado em Preferências → Worker da VM, e devolve o resultado. Instalação e operação: worker/README.md. Sem o worker, os modelos agy são pulados na hora e a cadeia segue para os fallbacks; os vídeos esperam na fila por até 6 horas.
+
+## Vídeo no Google Flow
+
+Depois que o Telegram confirma a mensagem de um produto, o painel põe um vídeo na fila e reserva o custo esperado (padrão 15 créditos), dentro do teto diário (padrão 75 créditos, horário de Brasília). O worker da VM:
+
+1. Abre o projeto do Flow configurado e confere as configurações do agente: confirmar antes de gerar, 9:16, 1 versão e o modelo esperado (padrão Omni 1.1 Flash).
+2. Inicia uma sessão nova, anexa a foto do anúncio e envia o prompt de 10 segundos.
+3. Lê o custo no cartão de confirmação do Flow. Só escolhe "Aprovar" (nunca "Sempre aprovar") se o Flow pedir o custo esperado para 1 geração. Antes de aprovar, registra no painel que os créditos podem ser gastos.
+4. Espera o vídeo, baixa em 720p, transcreve a narração com faster-whisper (modelo small, CPU) e usa o roteiro só para corrigir a grafia das palavras faladas. Aplica a legenda com ffmpeg e envia o MP4 ao painel.
+5. O painel responde à mensagem do produto no Telegram com o vídeo legendado.
+
+O Flow gera o vídeo sem textos na imagem, e a legenda é aplicada depois, para evitar erros de grafia da IA de vídeo. A legenda reproduz o que foi falado, inclusive repetições da narração gerada.
+
+Regras de segurança:
+- Login expirado, verificação do Google, custo diferente do esperado, falta de créditos, modelo diferente ou projeto não configurado pausam a fila e mandam um alerta no Telegram. Resolva o motivo (para login: worker/flow_login.sh) e toque em Retomar vídeos em Preferências.
+- Uma falha depois da aprovação marca o vídeo como incerto e mantém os créditos contados. Ela nunca gera de novo sozinha; confira o projeto no Flow. Falhas antes da aprovação liberam a reserva.
+- Teto atingido, geração desligada ou anúncio sem imagem: o produto fica sem vídeo, com o motivo no card. O botão "Gerar vídeo ↻" do card tenta de novo dentro do teto. "Reenviar vídeo" manda de novo um vídeo pronto que o Telegram recusou, sem gastar créditos.
 
 ## Unraid / Compose Manager
 
@@ -74,6 +91,7 @@ Os testes usam respostas simuladas e não enviam mensagens. Não existe senha pa
 - Concorrência de vídeos e quantidade de avaliações não são coletadas; valide manualmente.
 - A Open API traz nome, uma imagem, loja e preços, mas não as especificações nem as variantes do anúncio. A comparação de equivalentes depende dessa imagem e do título. Por isso, na dúvida, o modelo deve marcar "incerto". Confira os links antes de vincular ao vídeo: a elegibilidade e a comissão no canal Vídeo não são verificadas.
 - Anúncios equivalentes já enviados também ficam excluídos das próximas consultas, para não gerar outro vídeo do mesmo produto.
+- Um vídeo leva cerca de 2 minutos na VM (geração ~1 min, legenda ~15 s). A fidelidade do produto no vídeo depende do Flow: revise antes de publicar.
 - Uma consulta com análise leva cerca de 1 minuto por produto com o agy. O painel mostra o progresso. Produtos analisados no momento de um reinício são descartados, e a consulta fica como falha.
 - A coleta lê até o limite de páginas configurado, ordenadas por comissão. O ranking considera os produtos encontrados nesse intervalo, não o catálogo inteiro da Shopee. Aumente o limite ou use uma palavra-chave se faltarem anúncios inéditos.
 - Histórico registra ofertas elegíveis observadas; não é histórico completo do catálogo.

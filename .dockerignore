@@ -5,6 +5,7 @@
 !content.py
 !analysis.py
 !llm.py
+!video.py
 !static/
 !static/**
 !templates/
