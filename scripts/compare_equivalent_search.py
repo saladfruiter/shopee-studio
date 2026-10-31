@@ -99,9 +99,13 @@ def evaluate(products, search):
         store.worker_seen("compare", "local", ["llm"])
         stop = threading.Event()
 
-        def worker():
+        def heartbeat():  # Like the real worker: stays online while agy runs a long task.
             while not stop.is_set():
                 store.worker_touch("compare")
+                stop.wait(10)
+
+        def worker():
+            while not stop.is_set():
                 task = store.claim_task("compare", ["llm"])
                 if not task:
                     time.sleep(0.5)
@@ -112,8 +116,8 @@ def evaluate(products, search):
                 except Exception as error:
                     store.finish_task(task["id"], "compare", False, error=str(error))
 
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+        for target in (heartbeat, worker):
+            threading.Thread(target=target, daemon=True).start()
         engine = Engine(store, fetcher=lambda _: [], searcher=search)
         used = {p["key"] for p in products}
         try:
@@ -128,8 +132,13 @@ def evaluate(products, search):
                                     links=len(result["links"]), verdicts=verdicts,
                                     rounds=len(result["search"]["rounds"]), stopped=result["search"]["stopped"],
                                     calls=result["search"]["calls"], seconds=round(time.time() - started, 1),
+                                    round_details=result["search"]["rounds"], notes=result["notes"],
+                                    attempts=result["attempts"],
                                     matches=[dict(key=c["key"], name=c["name"], reason=c["reason"])
-                                             for c in result["equivalents"] if c["verdict"] == "match"]))
+                                             for c in result["equivalents"] if c["verdict"] == "match"],
+                                    reviewed=[dict(key=c["key"], name=c["name"][:120], verdict=c["verdict"],
+                                                   reason=c["reason"], round=c.get("round"))
+                                              for c in result["equivalents"]]))
                 print(f"  {product['name'][:60]}: {verdicts} em {results[-1]['seconds']} s", file=sys.stderr)
         finally:
             stop.set()
@@ -144,6 +153,7 @@ def main():
     parser.add_argument("--record", type=Path, help="grava as páginas reais, sem credenciais, neste arquivo")
     parser.add_argument("--evaluate", action="store_true", help="roda também as rodadas do modelo (agy local)")
     parser.add_argument("--output", type=Path, help="salva o relatório JSON neste arquivo")
+    parser.add_argument("--only", help="só os produtos cujo nome contém este texto")
     args = parser.parse_args()
 
     if args.live:
@@ -156,6 +166,8 @@ def main():
         products, responses = fixture["products"], fixture["responses"]
         search = Recorded(responses)
 
+    if args.only:
+        products = [p for p in products if args.only.casefold() in p["name"].casefold()]
     report = []
     for product in products:
         old, new = old_search(product, search), new_search(product, search)

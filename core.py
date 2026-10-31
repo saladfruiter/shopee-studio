@@ -804,8 +804,10 @@ class Engine:
                 equivalents = equivalents + reviewed
                 rounds.append(round_entry(number, batch, reviewed, self.clock() - round_started,
                                           error=safe_error(error)[:200]))
-                result["notes"].append(f"Rodada {number} de equivalência falhou: {safe_error(error)[:200]}")
-                stopped = f"falha na rodada {number}"
+                late = str(error).startswith("Prazo da análise esgotado")
+                result["notes"].append(f"Rodada {number} de equivalência " + ("interrompida pelo prazo." if late
+                                       else f"falhou: {safe_error(error)[:200]}"))
+                stopped = "prazo" if late else f"falha na rodada {number}"
                 break
             reviewed = analysis.review(product, batch, output, number)
             equivalents = equivalents + reviewed

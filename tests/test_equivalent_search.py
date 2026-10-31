@@ -245,6 +245,17 @@ class RoundsTest(unittest.TestCase):
         self.assertIn("falha", result["search"]["stopped"])
         self.assertEqual(len(runner.calls), 2)
 
+    def test_deadline_inside_a_round_is_reported_as_deadline(self):
+        class LateRunner(ScriptedRunner):
+            def run(self, *args, **kwargs):
+                if len(self.calls) == 1:
+                    self.calls.append({})
+                    raise ModelError("Prazo da análise esgotado: nenhuma nova chamada")
+                return super().run(*args, **kwargs)
+        result = self.analyze(LateRunner(matches={12}))
+        self.assertEqual(result["search"]["stopped"], "prazo")
+        self.assertEqual([link["key"] for link in result["links"]], ["1:1", "12:12"])
+
     def test_one_global_deadline_for_every_round(self):
         clock = [1000.0]
         self.engine.clock = lambda: clock[0]
